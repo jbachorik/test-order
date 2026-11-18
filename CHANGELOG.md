@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 ### Added
+- **Coverage-closure test selection** — `mvn test-order:affected`, `./gradlew testOrderAffected`, `test-order:auto` and `test-order:tiered-select` now guarantee that the selected subset exercises every changed class: a minimal cover core (greedy set cover over the changed-element universe) is force-included before the `topN` cap (the cap applies only to the remainder), and sole coverers of a changed element are exempt from skip-if-unchanged caching. Uncovered changed elements (no test exercises them per the dependency index) are reported as `Changed elements covered: X/Y (+N uncovered)` in the log and CI summary. New config key `testorder.coverage.enforce` (default `false`; Gradle DSL `testOrderCoverageEnforce`): when `true`, uncovered changed elements fail the build. When static analysis is degraded, selection fails safe to module select-all. Affected-mode runs now emit a CI summary (Gradle; previously only auto/tiered did).
+- **Non-source change detection** — changes to resources (`src/main/resources`, `src/test/resources`), build files (`pom.xml`, Gradle build/settings files) and config-like resources now make the module unselectable: all tests of the module run, with an explicit warning. Git-based change modes only; other modes treat non-source changes as unchanged (previous behavior).
 ### Changed
 ### Deprecated
 ### Removed
