@@ -1799,9 +1799,25 @@ public class TestOrderPlugin implements Plugin<Project> {
 
                 Path depsDir = ext.getDepsDir().get().getAsFile().toPath();
                 Path effectiveDepsDir = Files.isDirectory(depsDir) ? depsDir : null;
+
+                // Non-source select-all (parity with Maven AffectedWorkflow.selectWithAnalysis):
+                // a resources / build-file change is invisible to source-based change
+                // detection, so the module is unselectable — run ALL tests of the module
+                // instead of a selected subset. Only git-based change modes carry a
+                // non-source signal; NOT_DETERMINED (git unavailable) is treated as
+                // unchanged (pre-existing behavior). Requires an index so a cold start
+                // still resolves to learn via AutoWorkflow below.
+                if (Files.exists(indexPath) && applyNonSourceSelectAll(project, ext, pctx, (Test) t)) {
+                    return;
+                }
+
                 try {
+                    // runRemaining gates the coverage-enforce fail path in AutoWorkflow:
+                    // when the deferred tests run too (full suite), the closure check only
+                    // reports; when they do NOT run (testOrderAffected default), enforce
+                    // applies — parity with Maven AffectedMojo.
                     AutoWorkflow.Result result = new AutoWorkflow(
-                            pctx, "order", ciDownloadCb, effectiveDepsDir).execute();
+                            pctx, "order", ciDownloadCb, effectiveDepsDir, effectiveRunRemaining).execute();
 
                     if (result instanceof AutoWorkflow.Result.OrderSelect os) {
                         TestSelector.Selection selection = os.selection();
@@ -1819,6 +1835,12 @@ public class TestOrderPlugin implements Plugin<Project> {
                                 project.getLogger().lifecycle(line);
                             }
                         }
+
+                        // CI summary (mode "affected") — closes the parity gap where only
+                        // auto/tiered runs emitted a summary. Includes the coverage-closure
+                        // counts; no-op unless testorder.ci.summary=true.
+                        writeAffectedCiSummary(project, pctx, selection, os.changedClasses(), os.changedTests(),
+                                os.selectResult().coverageStatus(), "affected");
 
                         if (!effectiveRunRemaining && !selection.remaining().isEmpty()) {
                             project.getLogger().warn(
@@ -3003,6 +3025,8 @@ public class TestOrderPlugin implements Plugin<Project> {
                                 ext.getStaticAnalysisDepth().get()))
                 .selectiveLearn(resolveSelectiveLearn(project, ext))
                 .alwaysLearn(resolveAlwaysLearn(project, ext))
+                .coverageEnforce(resolveBoolean(gradleOrSystemProperty(project, "testorder.coverage.enforce"),
+                        ext.getTestOrderCoverageEnforce().get()))
                 .verboseFile(ext.getVerboseFile().get() != null && !ext.getVerboseFile().get().isBlank()
                         ? Path.of(ext.getVerboseFile().get()) : null)
                 .projectName(project.getName())
@@ -4046,6 +4070,136 @@ public class TestOrderPlugin implements Plugin<Project> {
             msg.append(" Set -Dtestorder.affected.preserveForkConfig=true to keep your config.");
             project.getLogger().lifecycle(msg.toString());
         }
+    }
+
+    /**
+     * Detects non-source changes (resources, build files) for the current project,
+     * mirroring core {@code AffectedWorkflow.detectNonSourceChanges} (package-private
+     * there, so re-implemented over the same public API): only git-based change
+     * modes carry a non-source signal — {@code uncommitted} inspects the working
+     * tree, {@code since-last-commit} diffs {@code HEAD~1}; hash-based
+     * ({@code since-last-run}) and {@code explicit} modes keep the pre-existing
+     * behavior (no detection — treated as unchanged). NOT_DETERMINED (git
+     * unavailable/failed) is treated as unchanged by the caller.
+     */
+    private static me.bechberger.testorder.changes.NonSourceChangeDetector.Detection detectNonSourceChanges(
+            Project project, PluginContext pctx, TestOrderExtension ext) {
+        me.bechberger.testorder.changes.ChangeDetector.Mode mode;
+        try {
+            mode = me.bechberger.testorder.changes.ChangeDetectionSupport.resolveMode(
+                    resolveChangeMode(project, ext), pctx.hashFile());
+        } catch (IOException e) {
+            pctx.log().debug("[test-order] Non-source change detection skipped: " + e.getMessage());
+            return me.bechberger.testorder.changes.NonSourceChangeDetector.Detection.NOT_DETERMINED;
+        }
+        if (mode != me.bechberger.testorder.changes.ChangeDetector.Mode.SINCE_LAST_COMMIT
+                && mode != me.bechberger.testorder.changes.ChangeDetector.Mode.UNCOMMITTED) {
+            // Hash-based or explicit mode: no git baseline to inspect — keep the
+            // pre-existing behavior (treated as unchanged).
+            pctx.log().debug("[test-order] Non-source change detection skipped for change mode " + mode);
+            return me.bechberger.testorder.changes.NonSourceChangeDetector.Detection.NOT_DETERMINED;
+        }
+        // PluginContext.repoRoot is always set (root project directory); the detector
+        // fails safe to NOT_DETERMINED when git is unavailable.
+        return me.bechberger.testorder.changes.NonSourceChangeDetector.detect(
+                pctx.projectRoot(), pctx.repoRoot(), mode == me.bechberger.testorder.changes.ChangeDetector.Mode.SINCE_LAST_COMMIT);
+    }
+
+    /**
+     * Non-source select-all (parity with Maven AffectedWorkflow.selectWithAnalysis):
+     * when a resources/build-file change is detected, the module is unselectable via
+     * source-based change detection — select ALL tests of the module (indexed plus
+     * unindexed new/changed), write the selected list, remove a stale remaining file,
+     * and emit a CI summary with mode {@code affected-nonsource-select-all}.
+     *
+     * @return true when a non-source change was detected and select-all was applied
+     */
+    private static boolean applyNonSourceSelectAll(Project project, TestOrderExtension ext,
+            PluginContext pctx, Test testTask) {
+        me.bechberger.testorder.changes.NonSourceChangeDetector.Detection nonSource =
+                detectNonSourceChanges(project, pctx, ext);
+        if (!nonSource.changed()) {
+            return false;
+        }
+        pctx.log().warn("[test-order] Non-source change detected — module behavior may change without a "
+                + "source-level change signal. Matched files: " + String.join(", ", nonSource.files()));
+        try {
+            // FOR_SELECTION_DETAILED: member-level change universe for the coverage
+            // closure, module-filtered and read-only (the baseline is NOT advanced —
+            // parity with Maven's affected goal, where a broken build must never look
+            // clean next run).
+            me.bechberger.testorder.ops.workflows.ChangeAnalysis.Result a =
+                    me.bechberger.testorder.ops.workflows.ChangeAnalysis.analyze(
+                            pctx, me.bechberger.testorder.ops.workflows.ChangeAnalysis.Options.FOR_SELECTION_DETAILED);
+
+            // Augment changedTests with unindexed tests from testClassesDir (same logic
+            // as AffectedWorkflow): handles modules whose tests haven't been learned yet.
+            Set<String> changedAndNew = new LinkedHashSet<>(a.changedTests());
+            Set<String> depMapTests = a.depMap().testClasses();
+            for (String testClass : me.bechberger.testorder.ops.ShowOrderOperation.collectAllTests(
+                    a.depMap(), a.changedTests(), pctx.testClassesDir())) {
+                if (!depMapTests.contains(testClass)) {
+                    changedAndNew.add(testClass);
+                }
+            }
+
+            Set<String> all = new LinkedHashSet<>(a.depMap().testClasses());
+            all.addAll(changedAndNew);
+            pctx.log().warn("[test-order] selecting ALL " + all.size()
+                    + " tests of this module (select-all; module is unselectable via source-based "
+                    + "change detection).");
+
+            me.bechberger.testorder.CoverageClosure closure = me.bechberger.testorder.CoverageClosure.compute(
+                    a.depMap(), a.changedClasses(), changedAndNew, a.changedMembers());
+            me.bechberger.testorder.CoverageClosure.Status covStatus = closure.status(all);
+            TestSelector.Selection selection = new TestSelector.Selection(
+                    new ArrayList<>(all), List.of(), 0, List.of(), covStatus);
+
+            // Parity with AffectedWorkflow.fullSelection: persist the selected list and
+            // remove a stale remaining file so run-remaining does not re-execute old
+            // deferrals.
+            if (pctx.selectedFile() != null) {
+                TestSelector.writeTestList(selection.selected(), pctx.selectedFile());
+            }
+            if (pctx.remainingFile() != null) {
+                Files.deleteIfExists(pctx.remainingFile());
+            }
+            applySelectedTests(testTask, selection.selected());
+
+            writeAffectedCiSummary(project, pctx, selection, a.changedClasses(), a.changedTests(),
+                    covStatus, "affected-nonsource-select-all");
+            return true;
+        } catch (IOException e) {
+            throw new GradleException("Failed to apply non-source select-all", e);
+        }
+    }
+
+    /**
+     * Emits a CI summary for the affected task (opt-in via {@code testorder.ci.summary},
+     * no-op otherwise). Includes the coverage-closure counts when the workflow ran the
+     * closure over a non-empty universe; omits the coverage row otherwise (same as the
+     * other selection paths).
+     */
+    private static void writeAffectedCiSummary(Project project, PluginContext pctx,
+            TestSelector.Selection selection, Set<String> changedClasses, Set<String> changedTests,
+            me.bechberger.testorder.CoverageClosure.Status coverageStatus, String mode) {
+        int totalInIndex = selection.selected().size() + selection.remaining().size()
+                + selection.cached().size();
+        Integer total = coverageStatus != null && coverageStatus.totalElements() > 0
+                ? coverageStatus.totalElements() : null;
+        Integer covered = total != null ? coverageStatus.coveredCount() : null;
+        Integer uncovered = total != null ? coverageStatus.uncoveredElements().size() : null;
+        Path stateDir = pctx.stateFile() != null && pctx.stateFile().getParent() != null
+                ? pctx.stateFile().getParent() : null;
+        me.bechberger.testorder.ops.CiSummaryWriter.writeSummary(
+                new me.bechberger.testorder.ops.CiSummaryWriter.SummaryInput(
+                        totalInIndex, selection.selected(), selection.remaining(),
+                        changedClasses, changedTests, List.of(), mode, 0,
+                        project.getLayout().getBuildDirectory().get().getAsFile().toPath(),
+                        total, covered, uncovered),
+                new me.bechberger.testorder.ops.CiSummaryWriter.RuntimeExtras(
+                        selection.cached(), 0L, stateDir),
+                pctx.log());
     }
 
     private static void applySelectedTests(Test task, List<String> tests) {

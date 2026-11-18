@@ -353,6 +353,86 @@ class TestOrderPluginIntegrationTest {
     }
 
     @Test
+    @DisplayName("testOrderAffected writes a CI summary (mode affected) with coverage counts")
+    void affectedTaskWritesCiSummary() throws IOException {
+        scaffoldProject();
+        runner("test", "-Dtestorder.mode=learn").build();
+
+        BuildResult result = runner("testOrderAffected",
+                "-Dtestorder.changeMode=explicit",
+                "-Dtestorder.changed.classes=com.example.app.Calculator",
+                "-Dtestorder.affected.topN=1",
+                "-Dtestorder.affected.randomM=0",
+                "-Dtestorder.ci.summary=true").build();
+
+        assertEquals(SUCCESS, result.task(":testOrderAffected").getOutcome());
+        assertTrue(Files.exists(projectDir.resolve("build/test-order-summary.md")),
+                "Markdown summary should be written for affected mode");
+        assertTrue(Files.exists(projectDir.resolve("build/test-order-summary.json")),
+                "JSON summary should be written for affected mode");
+        String md = Files.readString(projectDir.resolve("build/test-order-summary.md"));
+        assertTrue(md.contains("affected"), "Summary mode should be 'affected':\n" + md);
+        assertTrue(md.contains("Changed elements covered"),
+                "Summary should carry the coverage-closure row:\n" + md);
+        String json = Files.readString(projectDir.resolve("build/test-order-summary.json"));
+        assertTrue(json.contains("\"mode\": \"affected\""));
+        assertTrue(json.contains("changedElementsCovered"),
+                "JSON summary should carry coverage counts:\n" + json);
+    }
+
+    @Test
+    @DisplayName("testOrderAffected selects ALL tests on a non-source (resources) change")
+    void affectedTaskSelectsAllOnNonSourceChange() throws Exception {
+        scaffoldProject();
+        writeFile("src/main/resources/app.properties", "greeting=hello\n");
+        // Baseline: learn, then commit everything so the working tree is clean
+        runner("test", "-Dtestorder.mode=learn").build();
+        git(projectDir, "init");
+        git(projectDir, "config", "user.email", "test@example.com");
+        git(projectDir, "config", "user.name", "Test");
+        git(projectDir, "add", "-A");
+        git(projectDir, "commit", "-m", "baseline");
+        // Non-source change: a tracked resource file changes — invisible to
+        // source-based change detection
+        writeFile("src/main/resources/app.properties", "greeting=changed\n");
+
+        BuildResult result = runner("testOrderAffected",
+                "-Dtestorder.affected.topN=1",
+                "-Dtestorder.affected.randomM=0",
+                "-Dtestorder.ci.summary=true").build();
+
+        assertEquals(SUCCESS, result.task(":testOrderAffected").getOutcome());
+        assertTrue(result.getOutput().contains("Non-source change detected"),
+                "Non-source select-all must be logged:\n" + result.getOutput());
+        assertTrue(result.getOutput().contains("select-all"),
+                "Select-all must be explicit:\n" + result.getOutput());
+        List<String> selected = Files.readAllLines(projectDir.resolve("build/test-order-selected.txt"));
+        assertEquals(Set.of("com.example.app.CalculatorTest", "com.example.app.StringUtilsTest"),
+                Set.copyOf(selected),
+                "ALL tests of the module must be selected, got: " + selected);
+        assertFalse(Files.exists(projectDir.resolve("build/test-order-remaining.txt")),
+                "Stale remaining file must be removed by the select-all path");
+        String json = Files.readString(projectDir.resolve("build/test-order-summary.json"));
+        assertTrue(json.contains("\"mode\": \"affected-nonsource-select-all\""),
+                "Summary should carry the non-source select-all marker:\n" + json);
+    }
+
+    /** Runs a git command in the given directory, failing the test on non-zero exit. */
+    private static void git(Path dir, String... args) throws Exception {
+        java.util.List<String> cmd = new java.util.ArrayList<>();
+        cmd.add("git");
+        cmd.addAll(java.util.Arrays.asList(args));
+        Process process = new ProcessBuilder(cmd)
+                .directory(dir.toFile())
+                .inheritIO()
+                .start();
+        assertTrue(process.waitFor(60, TimeUnit.SECONDS),
+                "git " + String.join(" ", args) + " timed out");
+        assertEquals(0, process.exitValue(),
+                "git " + String.join(" ", args) + " failed");
+    }
+
+    @Test
     @DisplayName("testOrderRunRemaining runs only deferred tests")
     void runRemainingTaskRunsDeferredTests() throws IOException {
         scaffoldProject();

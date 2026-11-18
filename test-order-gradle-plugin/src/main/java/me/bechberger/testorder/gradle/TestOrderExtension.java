@@ -291,6 +291,17 @@ public abstract class TestOrderExtension {
     /** Minimum number of exercising tests for a class to be "well-tested". */
     public abstract Property<Integer> getCoverageThreshold();
 
+    /**
+     * Coverage-closure enforcement for the selection tasks (auto / testOrderAffected):
+     * when true, the build fails when the selected test subset does not exercise every
+     * changed element (class or member); when false (default), uncovered changed
+     * elements only produce a WARN. Maps to the {@code testorder.coverage.enforce}
+     * config key (a {@code -Dtestorder.coverage.enforce=} system property or
+     * {@code -Ptestorder.coverage.enforce=} Gradle property overrides this DSL value,
+     * same precedence as the other boolean properties).
+     */
+    public abstract Property<Boolean> getTestOrderCoverageEnforce();
+
     /** Output directory for coverage reports. */
     public abstract DirectoryProperty getCoverageOutputDir();
 
@@ -366,6 +377,7 @@ public abstract class TestOrderExtension {
         getDumpOutputFile().convention("");
         getCoverageThreshold().convention(2);
         getCoverageOutputDir().convention(project.getLayout().getBuildDirectory().dir("coverage-reports"));
+        getTestOrderCoverageEnforce().convention(false);
         // Score weight conventions intentionally omitted — when not explicitly configured,
         // PriorityClassOrderer uses weights from the state file (possibly optimizer-tuned)
         // or its own built-in defaults (newTest=100, changedTest=80, maxFailure=60, etc.).
