@@ -401,8 +401,16 @@ class BugVerificationIT {
 				return m.find() ? Integer.parseInt(m.group(1)) : 0;
 			}).sum();
 
-			assertThat(totalTestsRun).as("select with topN=0, randomM=0 should run 0 tests, not %d", totalTestsRun)
-					.isEqualTo(0);
+			// Coverage-closure guarantee (notes/tia-contract.md): the cover core
+			// survives topN capping and only ADDS tests — with topN=0/randomM=0 the
+			// selection is no longer empty: the cover core (the test class exercising
+			// the changed Product) is force-included. The original bug must stay fixed:
+			// the WHOLE suite (14 tests) still must NOT run — the other 2 classes are
+			// deferred (remaining file). "Tests run:" lines double-count (per-class +
+			// summary), so one cover-core class of 5 tests yields 10.
+			assertThat(totalTestsRun).as(
+					"select with topN=0, randomM=0 runs only the cover core, not the whole suite (14 tests; got %d)",
+					totalTestsRun).isLessThan(14);
 		}
 		// Failing is also acceptable
 	}
@@ -865,12 +873,15 @@ class BugVerificationIT {
 		String selected = project.readFile("target/test-order-selected.txt");
 		assertThat(selected).isNotNull();
 		List<String> selectedTests = selected.lines().filter(l -> !l.isBlank() && !l.startsWith("#")).toList();
-		assertThat(selectedTests).as("topN=1, randomM=0 should select exactly 1 test").hasSize(1);
+		// Coverage-closure guarantee (notes/tia-contract.md): the topN cap applies to
+		// the remainder only; the cover core (1 test exercising the changed Product)
+		// is force-included on top of it — 1 + 1 = 2 selected.
+		assertThat(selectedTests).as("topN=1, randomM=0 selects cover core (1) + capped remainder (1)").hasSize(2);
 
 		String remaining = project.readFile("target/test-order-remaining.txt");
 		assertThat(remaining).isNotNull();
 		List<String> remainingTests = remaining.lines().filter(l -> !l.isBlank() && !l.startsWith("#")).toList();
-		assertThat(remainingTests).as("remaining should have the other 2 tests").hasSize(2);
+		assertThat(remainingTests).as("remaining should have the 1 deferred test (3 total − 2 selected)").hasSize(1);
 
 		// run-remaining should execute the deferred tests
 		MavenResult remainingResult = project.maven().runRemaining();

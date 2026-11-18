@@ -74,6 +74,14 @@ public class TieredSelectMojo extends AbstractTestOrderMojo {
 	@Parameter(property = MavenPluginConfigKeys.TIERED_TIER3_FILE, defaultValue = "${project.build.directory}/test-order-tier3.txt")
 	private String tier3File;
 
+	/**
+	 * If true, fail the build when the tier-1 subset does not exercise every
+	 * changed element (tier-1 coverage-closure failure). Default false: uncovered
+	 * changed elements only produce a WARN.
+	 */
+	@Parameter(property = "testorder.coverage.enforce", defaultValue = "false")
+	private boolean coverageEnforce;
+
 	@Override
 	public void execute() throws MojoExecutionException {
 		initContext();
@@ -125,12 +133,14 @@ public class TieredSelectMojo extends AbstractTestOrderMojo {
 			}
 		}
 
-		PluginContext pctx = buildPluginContextBuilder().build();
+		PluginContext pctx = buildPluginContextBuilder().coverageEnforce(coverageEnforce).build();
 
-		// Run change analysis
+		// Run change analysis. FOR_SELECTION_DETAILED keeps the select-path read-only
+		// contract but adds the member-level change universe (structural analysis +
+		// method detection) the tier-1 coverage-closure check needs.
 		ChangeAnalysis.Result analysis;
 		try {
-			analysis = ChangeAnalysis.analyze(pctx, ChangeAnalysis.Options.FOR_SELECTION);
+			analysis = ChangeAnalysis.analyze(pctx, ChangeAnalysis.Options.FOR_SELECTION_DETAILED);
 		} catch (IOException e) {
 			throw new MojoExecutionException("Failed to analyze changes for tiered selection", e);
 		}
@@ -143,7 +153,7 @@ public class TieredSelectMojo extends AbstractTestOrderMojo {
 			result = TieredSelectOperation.select(new TieredSelectOperation.TieredSelectConfig(analysis.depMap(),
 					analysis.state(), analysis.changedClasses(), analysis.changedTests(), analysis.weights(),
 					tier2Fraction, weightByDuration, alwaysRun, Path.of(tier1File), Path.of(tier2File),
-					Path.of(tier3File), pluginLog()));
+					Path.of(tier3File), pluginLog(), analysis.changedMembers(), coverageEnforce));
 		} catch (IOException e) {
 			throw new MojoExecutionException("Failed to run tiered test selection", e);
 		}

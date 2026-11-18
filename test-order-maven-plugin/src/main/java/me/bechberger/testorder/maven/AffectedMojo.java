@@ -45,6 +45,14 @@ public class AffectedMojo extends AbstractTestOrderMojo {
 	@Parameter(property = MavenPluginConfigKeys.SELECT_SEED)
 	private Long seed;
 
+	/**
+	 * If true, fail the build when the selected test subset does not exercise every
+	 * changed element (coverage-closure failure). Default false: uncovered changed
+	 * elements only produce a WARN. Same flag on the tiered-select goal.
+	 */
+	@Parameter(property = "testorder.coverage.enforce", defaultValue = "false")
+	private boolean coverageEnforce;
+
 	/** File to write the remaining (not selected) test classes to. */
 	@Parameter(property = MavenPluginConfigKeys.SELECT_REMAINING_FILE, defaultValue = "${project.build.directory}/test-order-remaining.txt")
 	private String remainingFile;
@@ -130,7 +138,8 @@ public class AffectedMojo extends AbstractTestOrderMojo {
 		}
 
 		PluginContext pctx = buildPluginContextBuilder().topN(topN).randomM(randomM).seed(seed)
-				.selectedFile(Path.of(selectedFile)).remainingFile(Path.of(remainingFile)).build();
+				.coverageEnforce(coverageEnforce).selectedFile(Path.of(selectedFile))
+				.remainingFile(Path.of(remainingFile)).build();
 
 		AffectedOperation.SelectResult result;
 		me.bechberger.testorder.ops.workflows.ChangeAnalysis.Result analysis;
