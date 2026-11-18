@@ -11,6 +11,7 @@ import me.bechberger.testorder.TestSelector;
 import me.bechberger.testorder.changes.ChangeDetectionSupport;
 import me.bechberger.testorder.changes.ChangeDetector;
 import me.bechberger.testorder.changes.NonSourceChangeDetector;
+import me.bechberger.testorder.changes.RepoChangeListings;
 import me.bechberger.testorder.ops.AffectedOperation;
 import me.bechberger.testorder.ops.AlwaysRunScanner;
 import me.bechberger.testorder.ops.PluginContext;
@@ -66,14 +67,13 @@ public final class AffectedWorkflow {
 	 */
 	public static SelectWithAnalysis selectWithAnalysis(PluginContext ctx, boolean runRemaining) throws IOException {
 		// ── Fail-safe select-all trigger (cheap check FIRST) ──────
-		// Non-source changes (resources, build files) make the module unselectable
-		// via source-based change detection. The git-based check needs neither the
-		// index nor the analysis, so run it BEFORE the expensive member-level
-		// analysis: when select-all triggers, only the reduced class-level analysis
-		// runs (the structural/member detail is discarded on select-all anyway).
-		// NOT_DETERMINED is treated as unchanged (pre-existing behavior when git is
-		// unavailable).
-		NonSourceChangeDetector.Detection nonSource = detectNonSourceChanges(ctx);
+		// One repo-level git state validation (single spawn, RepoChangeListings)
+		// is acquired up front and shared by BOTH git consumers of this module's
+		// analysis: the non-source check below and the structural diff inside
+		// ChangeAnalysis. When the state cannot be validated, the snapshot is null
+		// and both consumers fall back to their direct git behavior.
+		RepoChangeListings.Snapshot repoSnapshot = sharedRepoSnapshot(ctx);
+		NonSourceChangeDetector.Detection nonSource = detectNonSourceChanges(ctx, repoSnapshot);
 		if (nonSource != null && nonSource.changed()) {
 			ctx.log().warn("[test-order] Non-source change detected — module behavior may change without a "
 					+ "source-level change signal. Matched files: " + String.join(", ", nonSource.files()));
@@ -92,7 +92,8 @@ public final class AffectedWorkflow {
 		// FOR_SELECTION_DETAILED: member-level change universe for cover-core
 		// selection (structural analysis + method detection), still module-filtered
 		// and read-only. See ChangeAnalysis.Options.FOR_SELECTION_DETAILED.
-		ChangeAnalysis.Result a = ChangeAnalysis.analyze(ctx, ChangeAnalysis.Options.FOR_SELECTION_DETAILED);
+		ChangeAnalysis.Result a = ChangeAnalysis.analyze(ctx, ChangeAnalysis.Options.FOR_SELECTION_DETAILED,
+				repoSnapshot);
 		return selectWithAnalysis(ctx, a, runRemaining);
 	}
 
@@ -260,6 +261,16 @@ public final class AffectedWorkflow {
 	 * caller.
 	 */
 	static NonSourceChangeDetector.Detection detectNonSourceChanges(PluginContext ctx) {
+		return detectNonSourceChanges(ctx, null);
+	}
+
+	/**
+	 * As {@link #detectNonSourceChanges(PluginContext)} with a pre-validated
+	 * repo-level snapshot (see {@link RepoChangeListings}): avoids the per-call
+	 * state validation when the caller already validated the same git root.
+	 */
+	static NonSourceChangeDetector.Detection detectNonSourceChanges(PluginContext ctx,
+			RepoChangeListings.Snapshot shared) {
 		boolean sinceLastCommit;
 		try {
 			ChangeDetector.Mode mode = ChangeDetectionSupport.resolveMode(ctx.changeMode(), ctx.hashFile());
@@ -275,7 +286,34 @@ public final class AffectedWorkflow {
 			return NonSourceChangeDetector.Detection.NOT_DETERMINED;
 		}
 		java.nio.file.Path gitRoot = resolveGitRoot(ctx);
-		return NonSourceChangeDetector.detect(ctx.projectRoot(), gitRoot, sinceLastCommit);
+		return NonSourceChangeDetector.detect(ctx.projectRoot(), gitRoot, sinceLastCommit, shared);
+	}
+
+	/**
+	 * Acquires one validated repo-level snapshot for this module's git consumers —
+	 * only when at least one of them will actually run (git-based structural
+	 * analysis or non-source detection); hash-based and explicit change modes keep
+	 * the pre-existing no-git-inspection behavior.
+	 */
+	static RepoChangeListings.Snapshot sharedRepoSnapshot(PluginContext ctx) {
+		boolean structuralApplicable = ChangeAnalysis.resolveStructuralDiffMode(ctx.changeMode(), ctx.changedClasses(),
+				ctx.hashFile()) != null;
+		boolean nonSourceApplicable = false;
+		try {
+			ChangeDetector.Mode mode = ChangeDetectionSupport.resolveMode(ctx.changeMode(), ctx.hashFile());
+			nonSourceApplicable = mode == ChangeDetector.Mode.SINCE_LAST_COMMIT
+					|| mode == ChangeDetector.Mode.UNCOMMITTED;
+		} catch (IOException e) {
+			nonSourceApplicable = false;
+		}
+		if (!structuralApplicable && !nonSourceApplicable) {
+			return null;
+		}
+		java.nio.file.Path gitRoot = resolveGitRoot(ctx);
+		if (gitRoot == null) {
+			return null;
+		}
+		return RepoChangeListings.acquire(gitRoot);
 	}
 
 	/**

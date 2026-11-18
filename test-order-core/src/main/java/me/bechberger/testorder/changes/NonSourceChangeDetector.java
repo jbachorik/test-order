@@ -109,6 +109,87 @@ public final class NonSourceChangeDetector {
 	 * @return the tri-state outcome plus the matched file list; never {@code null}
 	 */
 	public static Detection detect(Path projectRoot, Path gitRoot, boolean sinceLastCommit) {
+		return detect(projectRoot, gitRoot, sinceLastCommit, null);
+	}
+
+	/**
+	 * As {@link #detect(Path, Path, boolean)} with a shared repo-level snapshot:
+	 * when {@code shared} was validated against the same git root, its cached
+	 * repo-wide listings are filtered in-memory instead of spawning pathspec'd git
+	 * commands, and the (already-run) state validation is not repeated. Any cache
+	 * failure falls back to the direct git behavior below.
+	 */
+	public static Detection detect(Path projectRoot, Path gitRoot, boolean sinceLastCommit,
+			RepoChangeListings.Snapshot shared) {
+		if (projectRoot == null || gitRoot == null) {
+			return Detection.NOT_DETERMINED;
+		}
+		Path root = gitRoot.toAbsolutePath().normalize();
+		if (!Files.isDirectory(root)) {
+			return Detection.NOT_DETERMINED;
+		}
+		try {
+			RepoChangeListings.Snapshot snapshot = shared != null && shared.gitRoot().equals(root)
+					? shared
+					: RepoChangeListings.acquire(root);
+			if (snapshot != null) {
+				return detectFromSnapshot(projectRoot, root, sinceLastCommit, snapshot);
+			}
+		} catch (IOException | RuntimeException e) {
+			// fall through to the direct path
+		}
+		return detectDirect(projectRoot, gitRoot, sinceLastCommit);
+	}
+
+	/**
+	 * Cached variant: filters the repo-wide listings of a validated snapshot down
+	 * to the in-scope non-source inputs. The pathspec filter replicates git's
+	 * matching for the exact spec set {@link #pathspecs(String)} builds, so the
+	 * resulting path set is identical to the direct path's pathspec'd command
+	 * output (including its rename handling: a rename whose sides match different
+	 * pathspecs contributes only the matching side, exactly like the direct path's
+	 * pathspec'd {@code D}/{@code AM} output forms).
+	 */
+	private static Detection detectFromSnapshot(Path projectRoot, Path root, boolean sinceLastCommit,
+			RepoChangeListings.Snapshot snapshot) throws IOException {
+		String prefix = modulePrefix(root, projectRoot);
+		List<String> changedPaths;
+		if (sinceLastCommit) {
+			RepoChangeListings.LastCommitData lastCommit = snapshot.lastCommit();
+			if (lastCommit.diffFailed) {
+				// Same over-detection fallback as the direct path (one-time warning).
+				if (warnedUnavailableRoots.add(root)) {
+					TestOrderLogger.warn(
+							"git revision HEAD~1 is unavailable; treating all tracked non-source files as changed");
+				}
+				changedPaths = snapshot.trackedPaths();
+			} else {
+				changedPaths = new ArrayList<>();
+				for (String path : lastCommit.diffPaths) {
+					if (matchesPathspecs(path, prefix)) {
+						changedPaths.add(path);
+					}
+				}
+			}
+		} else {
+			changedPaths = new ArrayList<>();
+			for (String path : snapshot.statusPorcelainPaths()) {
+				if (matchesPathspecs(path, prefix)) {
+					changedPaths.add(path);
+				}
+			}
+		}
+		Set<String> matched = filterInScope(changedPaths, prefix);
+		if (matched.isEmpty()) {
+			return new Detection(Result.UNCHANGED, List.of());
+		}
+		return new Detection(Result.CHANGED, List.copyOf(matched));
+	}
+
+	/**
+	 * Direct git path — the pre-cache behavior, kept as the fail-safe fallback.
+	 */
+	private static Detection detectDirect(Path projectRoot, Path gitRoot, boolean sinceLastCommit) {
 		if (projectRoot == null || gitRoot == null) {
 			return Detection.NOT_DETERMINED;
 		}
@@ -234,6 +315,45 @@ public final class NonSourceChangeDetector {
 			}
 		}
 		return specs;
+	}
+
+	/**
+	 * Java replication of git's pathspec matching for the exact spec set
+	 * {@link #pathspecs(String)} builds — used by the cached path to filter the
+	 * repo-wide listing without a pathspec'd git invocation. Semantics (verified
+	 * against git 2.x):
+	 * <ul>
+	 * <li>a directory pathspec matches the directory itself and everything under it
+	 * (component-boundary aware)</li>
+	 * <li>{@code :(glob)**} + {@code /<name>} matches {@code <name>} at any depth,
+	 * including the repository root</li>
+	 * <li>a literal pathspec matches only the exact path</li>
+	 * </ul>
+	 * Paths are matched after decoding git's C-style quoting (git matches raw
+	 * paths), while {@link #filterInScope} keeps operating on the raw output text
+	 * exactly like the direct path does.
+	 */
+	static boolean matchesPathspecs(String repoPath, String prefix) {
+		String path = RepoChangeListings.unquoteGitPath(repoPath);
+		if (isDirectorySpecMatch(path, prefix + MAIN_RESOURCES)
+				|| isDirectorySpecMatch(path, prefix + TEST_RESOURCES)) {
+			return true;
+		}
+		int slash = path.lastIndexOf('/');
+		String name = slash < 0 ? path : path.substring(slash + 1);
+		if (!BUILD_FILES.contains(name)) {
+			return false;
+		}
+		if (prefix.isEmpty()) {
+			// literal specs: pom.xml, build.gradle, ... at the git root only
+			return path.equals(name);
+		}
+		// :(glob)**/<name> — any depth, including the git root
+		return true;
+	}
+
+	private static boolean isDirectorySpecMatch(String path, String spec) {
+		return path.equals(spec) || path.startsWith(spec + "/");
 	}
 
 	/**
