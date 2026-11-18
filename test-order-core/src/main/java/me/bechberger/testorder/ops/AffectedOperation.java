@@ -168,139 +168,153 @@ public final class AffectedOperation {
 			}
 		}
 
-		CoverageClosure closure = CoverageClosure.compute(config.depMap(), config.changedClasses(),
-				config.changedTests(), config.changedMembers());
-		TestSelector.Selection selection = new TestSelector(config.depMap(), config.state(), config.changedClasses(),
-				config.changedTests(), config.weights(),
-				new TestSelector.Config(config.topN(), config.randomM(), effectiveSeed), config.alwaysRunClasses(),
-				config.changeComplexity(),
-				config.cacheConfig() != null ? config.cacheConfig() : TestSelector.CacheConfig.DISABLED, closure)
-				.select();
-		CoverageClosure.Status coverageStatus = selection.coverageStatus();
-		if (closure.memberPrecisionUnavailable()) {
-			config.log().info("[test-order] Coverage closure runs at class-level precision: the dependency index has "
-					+ "no MEMBER instrumentation data. Re-run a learn phase to capture method-level dependencies "
-					+ "for method-level precision.");
-		}
-		// Coverage-closure outcome: WARN on uncovered changed elements; with
-		// coverageEnforce the build fails with an actionable message instead.
-		// Full file contract: the throw happens BEFORE the fresh selected/remaining
-		// lists of THIS run are written, and any stale selected/remaining files from
-		// a PREVIOUS run are deleted first — so a failed-closure run leaves neither
-		// a fresh nor a stale list that a file-existence-keyed CI step could consume.
-		if (coverageStatus != null && coverageStatus.totalElements() > 0 && !coverageStatus.allCovered()) {
-			List<String> uncovered = coverageStatus.uncoveredElements();
-			String sample = uncovered.stream().limit(3).collect(java.util.stream.Collectors.joining(", "));
-			String fullList = String.join(", ", uncovered);
-			String summaryLine = coverageStatus.coveredCount() + "/" + coverageStatus.totalElements()
-					+ " changed elements are exercised by the selected test subset; " + uncovered.size() + " uncovered";
-			if (config.coverageEnforce()) {
-				deleteSelectionArtifacts(config);
-				throw new IllegalStateException("[test-order] Coverage closure failed: " + summaryLine + ". Uncovered: "
-						+ fullList + ". No selected test exercises these changed elements — the "
-						+ "dependency index may be stale (tests added/changed since the last learn phase). Run a "
-						+ "learn phase to rebuild the index, run the full test suite, or disable enforcement "
-						+ "(-Dtestorder.coverage.enforce=false).");
+		// One per-selection overlap-join memo shared by the coverage closure and
+		// TestScorer: without it both pipelines run the identical per-test
+		// StructuralChangeAnalyzer.computeOverlapClasses join (~2x per affected
+		// test). Thread-confined and cleared in finally — it never outlives this
+		// select() call, and consumers on other threads / show-diagnostic paths see
+		// no index and keep their direct computation.
+		CoverageClosure.OverlapIndex overlapIndex = CoverageClosure.OverlapIndex.forSelection(config.depMap(),
+				config.changedClasses(), config.changedTests(), config.changedMembers());
+		CoverageClosure.OverlapIndex.install(overlapIndex);
+		try {
+			CoverageClosure closure = CoverageClosure.compute(config.depMap(), config.changedClasses(),
+					config.changedTests(), config.changedMembers(), overlapIndex);
+			TestSelector.Selection selection = new TestSelector(config.depMap(), config.state(),
+					config.changedClasses(), config.changedTests(), config.weights(),
+					new TestSelector.Config(config.topN(), config.randomM(), effectiveSeed), config.alwaysRunClasses(),
+					config.changeComplexity(),
+					config.cacheConfig() != null ? config.cacheConfig() : TestSelector.CacheConfig.DISABLED, closure)
+					.select();
+			CoverageClosure.Status coverageStatus = selection.coverageStatus();
+			if (closure.memberPrecisionUnavailable()) {
+				config.log()
+						.info("[test-order] Coverage closure runs at class-level precision: the dependency index has "
+								+ "no MEMBER instrumentation data. Re-run a learn phase to capture method-level dependencies "
+								+ "for method-level precision.");
 			}
-			config.log()
-					.warn("[test-order] Coverage closure: " + summaryLine + " (e.g. " + sample + "). Uncovered: "
-							+ fullList + ". Consider a learn phase ("
-							+ "mvn test -Dtestorder.mode=learn) or running the full suite.");
-		}
+			// Coverage-closure outcome: WARN on uncovered changed elements; with
+			// coverageEnforce the build fails with an actionable message instead.
+			// Full file contract: the throw happens BEFORE the fresh selected/remaining
+			// lists of THIS run are written, and any stale selected/remaining files from
+			// a PREVIOUS run are deleted first — so a failed-closure run leaves neither
+			// a fresh nor a stale list that a file-existence-keyed CI step could consume.
+			if (coverageStatus != null && coverageStatus.totalElements() > 0 && !coverageStatus.allCovered()) {
+				List<String> uncovered = coverageStatus.uncoveredElements();
+				String sample = uncovered.stream().limit(3).collect(java.util.stream.Collectors.joining(", "));
+				String fullList = String.join(", ", uncovered);
+				String summaryLine = coverageStatus.coveredCount() + "/" + coverageStatus.totalElements()
+						+ " changed elements are exercised by the selected test subset; " + uncovered.size()
+						+ " uncovered";
+				if (config.coverageEnforce()) {
+					deleteSelectionArtifacts(config);
+					throw new IllegalStateException("[test-order] Coverage closure failed: " + summaryLine
+							+ ". Uncovered: " + fullList + ". No selected test exercises these changed elements — the "
+							+ "dependency index may be stale (tests added/changed since the last learn phase). Run a "
+							+ "learn phase to rebuild the index, run the full test suite, or disable enforcement "
+							+ "(-Dtestorder.coverage.enforce=false).");
+				}
+				config.log()
+						.warn("[test-order] Coverage closure: " + summaryLine + " (e.g. " + sample + "). Uncovered: "
+								+ fullList + ". Consider a learn phase ("
+								+ "mvn test -Dtestorder.mode=learn) or running the full suite.");
+			}
 
-		// Warn when changed classes appear in deps of >50% of all tests: the scorer
-		// can't discriminate and the selection is essentially a random subset.
-		// Collapse into one summary when many classes exceed the threshold.
-		if (!config.changedClasses().isEmpty()) {
-			int totalTests = config.depMap().testClasses().size();
-			if (totalTests > 0) {
-				List<String> weakSignalClasses = new ArrayList<>();
-				for (String changed : config.changedClasses()) {
-					long matchCount = config.depMap().getAffectedTests(Set.of(changed)).size();
-					if (matchCount > totalTests / 2) {
-						weakSignalClasses.add(changed + " (" + (100 * matchCount / totalTests) + "%)");
+			// Warn when changed classes appear in deps of >50% of all tests: the scorer
+			// can't discriminate and the selection is essentially a random subset.
+			// Collapse into one summary when many classes exceed the threshold.
+			if (!config.changedClasses().isEmpty()) {
+				int totalTests = config.depMap().testClasses().size();
+				if (totalTests > 0) {
+					List<String> weakSignalClasses = new ArrayList<>();
+					for (String changed : config.changedClasses()) {
+						long matchCount = config.depMap().getAffectedTests(Set.of(changed)).size();
+						if (matchCount > totalTests / 2) {
+							weakSignalClasses.add(changed + " (" + (100 * matchCount / totalTests) + "%)");
+						}
+					}
+					if (!weakSignalClasses.isEmpty()) {
+						if (weakSignalClasses.size() == 1) {
+							config.log().warn("[test-order] Changed class " + weakSignalClasses.get(0)
+									+ " appears in deps of >50% of tests. Selection signal is weak — results may be"
+									+ " near-random. Consider running the full suite.");
+						} else {
+							String sample = weakSignalClasses.stream().limit(3)
+									.collect(java.util.stream.Collectors.joining(", "));
+							config.log()
+									.warn("[test-order] " + weakSignalClasses.size()
+											+ " changed classes appear in deps of >50% of tests (e.g. " + sample
+											+ "). Selection signal is weak — consider running the full suite.");
+						}
 					}
 				}
-				if (!weakSignalClasses.isEmpty()) {
-					if (weakSignalClasses.size() == 1) {
-						config.log()
-								.warn("[test-order] Changed class " + weakSignalClasses.get(0)
-										+ " appears in deps of >50% of tests. Selection signal is weak — results may be"
-										+ " near-random. Consider running the full suite.");
-					} else {
-						String sample = weakSignalClasses.stream().limit(3)
-								.collect(java.util.stream.Collectors.joining(", "));
-						config.log()
-								.warn("[test-order] " + weakSignalClasses.size()
-										+ " changed classes appear in deps of >50% of tests (e.g. " + sample
-										+ "). Selection signal is weak — consider running the full suite.");
+			}
+
+			if (config.selectedFile() != null) {
+				TestSelector.writeTestList(selection.selected(), config.selectedFile());
+			}
+			if (config.remainingFile() != null) {
+				if (!selection.remaining().isEmpty()) {
+					TestSelector.writeTestList(selection.remaining(), config.remainingFile());
+				} else {
+					// Delete stale remaining file from a previous run to prevent run-remaining
+					// from re-executing deferred tests that are no longer relevant.
+					try {
+						java.nio.file.Files.deleteIfExists(config.remainingFile());
+					} catch (IOException e) {
+						config.log().warn("[test-order] Could not delete stale remaining file " + config.remainingFile()
+								+ ": " + e.getMessage());
 					}
 				}
 			}
-		}
 
-		if (config.selectedFile() != null) {
-			TestSelector.writeTestList(selection.selected(), config.selectedFile());
-		}
-		if (config.remainingFile() != null) {
-			if (!selection.remaining().isEmpty()) {
-				TestSelector.writeTestList(selection.remaining(), config.remainingFile());
+			boolean allSelected = selection.remaining().isEmpty() && selection.cached().isEmpty();
+			int alwaysRunCount = 0;
+			int newCount = 0;
+			int fastCount = selection.randomFastCount();
+			int scoredCount = 0;
+			if (!selection.selected().isEmpty() || !selection.remaining().isEmpty()) {
+				alwaysRunCount = (int) selection.selected().stream().filter(t -> config.alwaysRunClasses().contains(t))
+						.count();
+				newCount = (int) selection.selected().stream().filter(
+						t -> !config.depMap().testClasses().contains(t) && !config.alwaysRunClasses().contains(t))
+						.count();
+				scoredCount = Math.max(0, selection.selected().size() - alwaysRunCount - newCount - fastCount);
+			}
+			if (selection.selected().isEmpty() && selection.remaining().isEmpty()) {
+				// no tests in depMap — nothing to report
+			} else if (allSelected) {
+				config.log().info("[test-order] Selected all " + selection.selected().size()
+						+ " affected tests (topN=-1, running in priority order)");
 			} else {
-				// Delete stale remaining file from a previous run to prevent run-remaining
-				// from re-executing deferred tests that are no longer relevant.
-				try {
-					java.nio.file.Files.deleteIfExists(config.remainingFile());
-				} catch (IOException e) {
-					config.log().warn("[test-order] Could not delete stale remaining file " + config.remainingFile()
-							+ ": " + e.getMessage());
+				StringBuilder bd = new StringBuilder();
+				if (scoredCount > 0)
+					bd.append(scoredCount).append(" scored");
+				if (newCount > 0) {
+					if (bd.length() > 0)
+						bd.append(" + ");
+					bd.append(newCount).append(" new");
 				}
+				if (alwaysRunCount > 0) {
+					if (bd.length() > 0)
+						bd.append(" + ");
+					bd.append(alwaysRunCount).append(" always-run");
+				}
+				if (fastCount > 0) {
+					if (bd.length() > 0)
+						bd.append(" + ");
+					bd.append(fastCount).append(" fast-diverse");
+				}
+				config.log().info("[test-order] Selected " + selection.selected().size() + " tests (" + bd
+						+ "), deferred " + selection.remaining().size());
 			}
-		}
 
-		boolean allSelected = selection.remaining().isEmpty() && selection.cached().isEmpty();
-		int alwaysRunCount = 0;
-		int newCount = 0;
-		int fastCount = selection.randomFastCount();
-		int scoredCount = 0;
-		if (!selection.selected().isEmpty() || !selection.remaining().isEmpty()) {
-			alwaysRunCount = (int) selection.selected().stream().filter(t -> config.alwaysRunClasses().contains(t))
-					.count();
-			newCount = (int) selection.selected().stream()
-					.filter(t -> !config.depMap().testClasses().contains(t) && !config.alwaysRunClasses().contains(t))
-					.count();
-			scoredCount = Math.max(0, selection.selected().size() - alwaysRunCount - newCount - fastCount);
+			SelectionSummary summary = SelectionSummary.from(selection, scoredCount, newCount, alwaysRunCount,
+					fastCount, coverageStatus);
+			return new SelectResult(selection, allSelected, summary, coverageStatus);
+		} finally {
+			CoverageClosure.OverlapIndex.clear();
 		}
-		if (selection.selected().isEmpty() && selection.remaining().isEmpty()) {
-			// no tests in depMap — nothing to report
-		} else if (allSelected) {
-			config.log().info("[test-order] Selected all " + selection.selected().size()
-					+ " affected tests (topN=-1, running in priority order)");
-		} else {
-			StringBuilder bd = new StringBuilder();
-			if (scoredCount > 0)
-				bd.append(scoredCount).append(" scored");
-			if (newCount > 0) {
-				if (bd.length() > 0)
-					bd.append(" + ");
-				bd.append(newCount).append(" new");
-			}
-			if (alwaysRunCount > 0) {
-				if (bd.length() > 0)
-					bd.append(" + ");
-				bd.append(alwaysRunCount).append(" always-run");
-			}
-			if (fastCount > 0) {
-				if (bd.length() > 0)
-					bd.append(" + ");
-				bd.append(fastCount).append(" fast-diverse");
-			}
-			config.log().info("[test-order] Selected " + selection.selected().size() + " tests (" + bd + "), deferred "
-					+ selection.remaining().size());
-		}
-
-		SelectionSummary summary = SelectionSummary.from(selection, scoredCount, newCount, alwaysRunCount, fastCount,
-				coverageStatus);
-		return new SelectResult(selection, allSelected, summary, coverageStatus);
 	}
 
 	/**

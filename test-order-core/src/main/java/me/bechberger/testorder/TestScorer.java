@@ -179,6 +179,13 @@ public class TestScorer {
 	 * explain()).
 	 */
 	private final Map<String, Set<String>> cachedOverlapClasses;
+	/**
+	 * Per-selection overlap-join memo shared with {@link CoverageClosure}, picked
+	 * up from the thread-confined {@link CoverageClosure.OverlapIndex#current()}
+	 * installed by the selection orchestration. {@code null} outside a selection
+	 * run (show/diagnostic paths) — those keep the direct computation.
+	 */
+	private final CoverageClosure.OverlapIndex overlapIndex;
 
 	/**
 	 * Builder for {@link TestScorer} to avoid constructor overload ambiguity.
@@ -299,6 +306,7 @@ public class TestScorer {
 		this.medianDuration = computeMedianDuration(state, testClassNames);
 		this.cachedOverlapCounts = new HashMap<>();
 		this.cachedOverlapClasses = new HashMap<>();
+		this.overlapIndex = CoverageClosure.OverlapIndex.current();
 
 		// Build effective changed set: production classes + test utility classes.
 		// This ensures that tests depending on changed test helpers get a depOverlap
@@ -347,10 +355,19 @@ public class TestScorer {
 		// Build coverage map only for affected tests
 		Map<String, Set<String>> coverage = new LinkedHashMap<>();
 		for (String test : affectedTests) {
-			Set<String> deps = depMap.get(test);
-			Set<String> memberDeps = depMap.hasMemberDeps() ? depMap.getMemberDeps(test) : null;
-			Set<String> covered = StructuralChangeAnalyzer.computeOverlapClasses(deps, memberDeps, changedMembers,
-					effectiveChangedForOverlap);
+			Set<String> covered;
+			if (overlapIndex != null) {
+				// shared per-selection join: the index memoizes the raw overlap against
+				// the union match set once per test; filtering with our match set
+				// (changed production ∪ changed test classes) yields exactly what the
+				// direct computeOverlapClasses call below would return.
+				covered = overlapIndex.overlapFor(test, effectiveChangedForOverlap);
+			} else {
+				Set<String> deps = depMap.get(test);
+				Set<String> memberDeps = depMap.hasMemberDeps() ? depMap.getMemberDeps(test) : null;
+				covered = StructuralChangeAnalyzer.computeOverlapClasses(deps, memberDeps, changedMembers,
+						effectiveChangedForOverlap);
+			}
 			// cache both overlap count and classes to avoid re-calling
 			// computeOverlapClasses in score() and explain()
 			cachedOverlapCounts.put(test, covered.size());
@@ -389,7 +406,9 @@ public class TestScorer {
 	 */
 	private OverlapData resolveOverlap(String testClassName, Set<String> deps, Set<String> memberDeps) {
 		Set<String> overlapClasses;
-		if (!setCoverBonuses.isEmpty() || cachedOverlapClasses.containsKey(testClassName)) {
+		if (overlapIndex != null) {
+			overlapClasses = overlapIndex.overlapFor(testClassName, effectiveChangedForOverlap);
+		} else if (!setCoverBonuses.isEmpty() || cachedOverlapClasses.containsKey(testClassName)) {
 			overlapClasses = cachedOverlapClasses.getOrDefault(testClassName, null);
 			if (overlapClasses == null) {
 				overlapClasses = StructuralChangeAnalyzer.computeOverlapClasses(deps, memberDeps, changedMembers,

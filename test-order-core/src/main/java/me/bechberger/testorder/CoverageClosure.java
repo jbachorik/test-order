@@ -3,6 +3,7 @@ package me.bechberger.testorder;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -66,6 +67,196 @@ public final class CoverageClosure {
 	}
 
 	private static final Status EMPTY_STATUS = new Status(0, 0, List.of());
+
+	/**
+	 * Per-selection memo of the per-test overlap join
+	 * ({@link StructuralChangeAnalyzer#computeOverlapClasses}) that is otherwise
+	 * run TWICE per affected test in one {@code select()} call: once by
+	 * {@link TestScorer}'s set-cover pipeline (over changed production classes ∪
+	 * changed test classes) and once by {@link CoverageClosure#compute} (over the
+	 * production-only candidate universe plus its top-level aliases).
+	 *
+	 * <p>
+	 * The two pipelines' match sets deliberately differ (the scorer's includes
+	 * changed test classes; the closure's is the production-only universe with
+	 * nested-class aliases), so their results are NOT interchangeable. What IS
+	 * shared is the raw join against the UNION of both match sets: the class-level
+	 * overlap branches match each dependency independently and monotonically in the
+	 * match set, so each consumer's exact result is recovered by filtering the
+	 * memoized raw set with {@link DependencyMap#changedClassesContains} against
+	 * its own match set. The member-level branch ignores the match set entirely, so
+	 * its result is passed through unfiltered (it is already identical for every
+	 * consumer).
+	 *
+	 * <p>
+	 * The index is thread-confined ({@link #install}/{@link #clear}) and must live
+	 * only within a single {@code select()} call — no cross-run caching. Consumers
+	 * that find no installed index (show/diagnostic paths, other threads) keep
+	 * their legacy direct computation, byte-for-byte.
+	 */
+	public static final class OverlapIndex {
+
+		private static final ThreadLocal<OverlapIndex> CURRENT = new ThreadLocal<>();
+
+		/**
+		 * Installs the index for the current thread's selection run (a {@code null}
+		 * argument is a no-op). Callers must {@link #clear()} in a {@code finally}
+		 * block.
+		 */
+		public static void install(OverlapIndex index) {
+			if (index != null) {
+				CURRENT.set(index);
+			}
+		}
+
+		/**
+		 * The index installed for the current thread, or {@code null} outside a
+		 * selection run.
+		 */
+		public static OverlapIndex current() {
+			return CURRENT.get();
+		}
+
+		/**
+		 * Clears the thread-confined index; every selection run calls this in
+		 * {@code finally}.
+		 */
+		public static void clear() {
+			CURRENT.remove();
+		}
+
+		/**
+		 * Creates an index for one selection run, or {@code null} when there is no
+		 * change signal (nothing to memoize — consumers keep their legacy direct path).
+		 * The initial union match set is a SUPERSET of both consumers' match sets:
+		 * changed production classes ∪ changed test classes (the scorer's effective
+		 * match set) ∪ {@link ChangedMembers#changedClasses()};
+		 * {@link CoverageClosure#compute} extends it with the closure's candidate query
+		 * before any raw overlap is memoized.
+		 */
+		public static OverlapIndex forSelection(DependencyMap depMap, Set<String> changedClasses,
+				Set<String> changedTestClasses, ChangedMembers changedMembers) {
+			boolean hasSignal = (changedClasses != null && !changedClasses.isEmpty())
+					|| (changedTestClasses != null && !changedTestClasses.isEmpty())
+					|| (changedMembers != null && !changedMembers.changedClasses().isEmpty());
+			if (!hasSignal) {
+				return null;
+			}
+			Set<String> union = new LinkedHashSet<>();
+			if (changedClasses != null) {
+				union.addAll(changedClasses);
+			}
+			if (changedTestClasses != null) {
+				union.addAll(changedTestClasses);
+			}
+			if (changedMembers != null) {
+				union.addAll(changedMembers.changedClasses());
+			}
+			return new OverlapIndex(depMap, changedMembers, union);
+		}
+
+		private final DependencyMap depMap;
+		private final ChangedMembers changedMembers;
+		/**
+		 * Union of both consumers' match sets; extended by compute() before first use.
+		 */
+		private Set<String> unionMatchSet;
+		/** test class → raw overlap against the union match set (memoized). */
+		private final Map<String, Set<String>> rawByTest = new HashMap<>();
+		/**
+		 * test class → true when the member-level branch applied (result is match-set
+		 * independent).
+		 */
+		private final Map<String, Boolean> memberLevelByTest = new HashMap<>();
+		/** Number of underlying computeOverlapClasses invocations (dedup evidence). */
+		private long rawComputations;
+
+		private OverlapIndex(DependencyMap depMap, ChangedMembers changedMembers, Set<String> unionMatchSet) {
+			this.depMap = depMap;
+			this.changedMembers = changedMembers;
+			this.unionMatchSet = unionMatchSet;
+		}
+
+		/**
+		 * Extends the union match set with the closure's candidate query. Must be
+		 * called BEFORE the first memoized lookup: a raw set computed against a smaller
+		 * union is not a superset of a consumer's result for a match set added later,
+		 * and filtering it would silently drop deps.
+		 */
+		void extendMatchSet(Set<String> additional) {
+			if (!rawByTest.isEmpty()) {
+				throw new IllegalStateException(
+						"OverlapIndex match set extended after the first memoized overlap computation — "
+								+ "CoverageClosure.compute must run before any TestScorer scoring on this index");
+			}
+			unionMatchSet.addAll(additional);
+		}
+
+		/**
+		 * The raw per-test overlap set against the union match set, computed ONCE per
+		 * test and memoized. The member-deps guard mirrors TestScorer's
+		 * ({@code hasMemberDeps()}): for computeOverlapClasses the guard difference
+		 * against CoverageClosure's {@code hasClassMemberDeps()} is immaterial — with
+		 * method-only member data both a null and an empty set take the class-level
+		 * branch.
+		 *
+		 * <p>
+		 * The returned set is memoized and shared — callers must not mutate it.
+		 */
+		private Set<String> rawOverlap(String test) {
+			return rawByTest.computeIfAbsent(test, t -> {
+				Set<String> deps = depMap.get(t);
+				if (deps == null) {
+					deps = Set.of();
+				}
+				Set<String> memberDeps = depMap.hasMemberDeps() ? depMap.getMemberDeps(t) : null;
+				rawComputations++;
+				Set<String> raw = StructuralChangeAnalyzer.computeOverlapClasses(deps, memberDeps, changedMembers,
+						unionMatchSet);
+				// Same dispatch as computeOverlapClasses: the member-level branch ran when
+				// member change data exists AND the test has member deps — its result
+				// never consults the match set, so no per-consumer filtering may apply.
+				boolean memberLevel = changedMembers != null && !changedMembers.changedClasses().isEmpty()
+						&& memberDeps != null && !memberDeps.isEmpty();
+				memberLevelByTest.put(t, memberLevel);
+				return raw;
+			});
+		}
+
+		/**
+		 * The exact overlap set the calling consumer would get from
+		 * {@code computeOverlapClasses(deps, memberDeps, changedMembers, matchSet)}:
+		 * the memoized raw set filtered per dependency with
+		 * {@link DependencyMap#changedClassesContains} (the class-level branches match
+		 * each dep independently), or the raw set itself when the member-level branch
+		 * applied (match-set independent result).
+		 */
+		public Set<String> overlapFor(String test, Set<String> matchSet) {
+			Set<String> raw = rawOverlap(test);
+			if (raw.isEmpty()) {
+				return Set.of();
+			}
+			if (Boolean.TRUE.equals(memberLevelByTest.get(test))) {
+				return raw;
+			}
+			Set<String> filtered = new LinkedHashSet<>();
+			for (String dep : raw) {
+				if (DependencyMap.changedClassesContains(matchSet, dep)) {
+					filtered.add(dep);
+				}
+			}
+			return filtered;
+		}
+
+		/**
+		 * Number of underlying {@link StructuralChangeAnalyzer#computeOverlapClasses}
+		 * invocations performed by this index — the dedup evidence: one per DISTINCT
+		 * candidate test instead of one per candidate per consumer pipeline.
+		 */
+		public long rawComputationCount() {
+			return rawComputations;
+		}
+	}
 
 	private final Set<String> universe;
 	/** test class → universe elements it covers (non-empty entries only). */
@@ -136,6 +327,24 @@ public final class CoverageClosure {
 	 */
 	public static CoverageClosure compute(DependencyMap depMap, Set<String> changedClasses,
 			Set<String> changedTestClasses, ChangedMembers changedMembers) {
+		return compute(depMap, changedClasses, changedTestClasses, changedMembers, null);
+	}
+
+	/**
+	 * Computes the closure view for one selection run, reusing the per-test overlap
+	 * join already memoized in {@code sharedOverlaps} (see {@link OverlapIndex}).
+	 * The inputs and the resulting universe/candidates are identical to
+	 * {@link #compute(DependencyMap, Set, Set, ChangedMembers)} — only WHERE the
+	 * per-test join runs changes, so existing {@code compute} callers are
+	 * unaffected.
+	 *
+	 * @param sharedOverlaps
+	 *            the per-selection overlap index installed by the selection
+	 *            orchestration, or {@code null} to compute the join directly
+	 *            (legacy path)
+	 */
+	public static CoverageClosure compute(DependencyMap depMap, Set<String> changedClasses,
+			Set<String> changedTestClasses, ChangedMembers changedMembers, OverlapIndex sharedOverlaps) {
 		Set<String> knownTests = depMap.testClasses();
 		Set<String> universe = new LinkedHashSet<>();
 		if (changedClasses != null) {
@@ -219,12 +428,22 @@ public final class CoverageClosure {
 		// degrades to class-level coverage sets just like an index without any
 		// member data.
 		boolean hasClassMemberDeps = depMap.hasClassMemberDeps();
+		if (sharedOverlaps != null) {
+			// The raw join is memoized against the union of BOTH consumers' match
+			// sets; the closure's candidate query must join that union before the
+			// first memoized lookup (see OverlapIndex#extendMatchSet).
+			sharedOverlaps.extendMatchSet(candidateQuery);
+		}
 		Map<String, Set<String>> coverage = new LinkedHashMap<>();
 		for (String test : candidates) {
-			Set<String> deps = depMap.get(test);
-			Set<String> memberDeps = hasClassMemberDeps ? depMap.getMemberDeps(test) : null;
-			Set<String> raw = StructuralChangeAnalyzer.computeOverlapClasses(deps, memberDeps, changedMembers,
-					candidateQuery);
+			Set<String> raw;
+			if (sharedOverlaps != null) {
+				raw = sharedOverlaps.overlapFor(test, candidateQuery);
+			} else {
+				Set<String> deps = depMap.get(test);
+				Set<String> memberDeps = hasClassMemberDeps ? depMap.getMemberDeps(test) : null;
+				raw = StructuralChangeAnalyzer.computeOverlapClasses(deps, memberDeps, changedMembers, candidateQuery);
+			}
 			Set<String> covered = new LinkedHashSet<>();
 			for (String dep : raw) {
 				covered.addAll(resolveToUniverse(dep, universe, knownTests));

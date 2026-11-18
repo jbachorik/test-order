@@ -92,11 +92,26 @@ public final class TieredSelectOperation {
 	 *             if writing tier files fails
 	 */
 	public static TieredSelectResult select(TieredSelectConfig config) throws IOException {
+		// Shared per-selection overlap-join memo (see AffectedOperation.select):
+		// the closure and TieredTestSelector's TestScorer otherwise run the
+		// identical per-test join twice. Thread-confined, cleared in finally.
+		CoverageClosure.OverlapIndex overlapIndex = CoverageClosure.OverlapIndex.forSelection(config.depMap(),
+				config.changedClasses(), config.changedTests(), config.changedMembers());
+		CoverageClosure.OverlapIndex.install(overlapIndex);
+		try {
+			return selectWithSharedOverlaps(config, overlapIndex);
+		} finally {
+			CoverageClosure.OverlapIndex.clear();
+		}
+	}
+
+	private static TieredSelectResult selectWithSharedOverlaps(TieredSelectConfig config,
+			CoverageClosure.OverlapIndex overlapIndex) throws IOException {
 		if (config.staticAnalysisDegraded()) {
-			return degradedSelectAll(config);
+			return degradedSelectAll(config, overlapIndex);
 		}
 		CoverageClosure closure = CoverageClosure.compute(config.depMap(), config.changedClasses(),
-				config.changedTests(), config.changedMembers());
+				config.changedTests(), config.changedMembers(), overlapIndex);
 		TieredTestSelector.TieredSelection selection = new TieredTestSelector(config.depMap(), config.state(),
 				config.changedClasses(), config.changedTests(), config.weights(),
 				new TieredTestSelector.Config(config.tier2Fraction(), config.weightByDuration()),
@@ -149,7 +164,8 @@ public final class TieredSelectOperation {
 	 * must fail safe (select-all), not fail closed. Same synthesis as
 	 * {@code AffectedWorkflow#fullSelection}.
 	 */
-	private static TieredSelectResult degradedSelectAll(TieredSelectConfig config) throws IOException {
+	private static TieredSelectResult degradedSelectAll(TieredSelectConfig config,
+			CoverageClosure.OverlapIndex overlapIndex) throws IOException {
 		java.util.LinkedHashSet<String> all = new java.util.LinkedHashSet<>(config.depMap().testClasses());
 		all.addAll(config.changedTests());
 		if (config.coverageEnforce()) {
@@ -161,7 +177,7 @@ public final class TieredSelectOperation {
 						+ "(class-level fallback). Selecting ALL " + all.size()
 						+ " tests of this module in tier 1 (fail-safe select-all; tiers 2/3 are empty).");
 		CoverageClosure closure = CoverageClosure.compute(config.depMap(), config.changedClasses(),
-				config.changedTests(), config.changedMembers());
+				config.changedTests(), config.changedMembers(), overlapIndex);
 		CoverageClosure.Status status = closure.status(all);
 		warnUncoveredElements(config.log(), status);
 		TieredTestSelector.TieredSelection selection = new TieredTestSelector.TieredSelection(
