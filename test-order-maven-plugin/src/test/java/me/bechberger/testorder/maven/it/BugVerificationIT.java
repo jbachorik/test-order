@@ -403,14 +403,27 @@ class BugVerificationIT {
 
 			// Coverage-closure guarantee (notes/tia-contract.md): the cover core
 			// survives topN capping and only ADDS tests — with topN=0/randomM=0 the
-			// selection is no longer empty: the cover core (the test class exercising
-			// the changed Product) is force-included. The original bug must stay fixed:
-			// the WHOLE suite (14 tests) still must NOT run — the other 2 classes are
-			// deferred (remaining file). "Tests run:" lines double-count (per-class +
-			// summary), so one cover-core class of 5 tests yields 10.
+			// selection is exactly the cover core: the class exercising the changed
+			// Product (ProductTest) is force-included and the other 2 classes are
+			// deferred to the remaining file.
+			String selected = project.readFile("target/test-order-selected.txt");
+			assertThat(selected).as("selected file should exist for the cover-core selection").isNotNull();
+			List<String> selectedTests = selected.lines().filter(l -> !l.isBlank() && !l.startsWith("#")).toList();
+			assertThat(selectedTests).as("topN=0, randomM=0 selects exactly the cover core (ProductTest)")
+					.containsExactly(PRODUCT_TEST);
+			String remaining = project.readFile("target/test-order-remaining.txt");
+			assertThat(remaining).as("remaining file should exist for the 2 deferred classes").isNotNull();
+			List<String> remainingTests = remaining.lines().filter(l -> !l.isBlank() && !l.startsWith("#")).toList();
+			assertThat(remainingTests).as("the other 2 test classes are deferred (remaining file)")
+					.containsExactlyInAnyOrder(CART_TEST, INVOICE_TEST);
+
+			// The original bug must stay fixed: the WHOLE suite (14 tests) still must
+			// NOT run. "Tests run:" lines double-count (per-class line + summary line),
+			// so the single cover-core class of 5 tests yields 10; 11+ would mean more
+			// than the cover core ran.
 			assertThat(totalTestsRun).as(
 					"select with topN=0, randomM=0 runs only the cover core, not the whole suite (14 tests; got %d)",
-					totalTestsRun).isLessThan(14);
+					totalTestsRun).isLessThan(11);
 		}
 		// Failing is also acceptable
 	}

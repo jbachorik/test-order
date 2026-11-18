@@ -146,10 +146,31 @@ public final class CoverageClosure {
 			}
 		}
 		if (changedMembers != null) {
+			// LOAD-BEARING: changedMembers.changedClasses() contains not only the
+			// structurally changed classes but also every class the static call-graph
+			// expansion merely REACHED (callers of changed code, up to the configured
+			// depth). Those caller classes did NOT change; letting them into the
+			// universe violates the contract universe ("changed classes ∪ changed
+			// member keys", notes/tia-contract.md) and inflates the cover core:
+			// unchanged code would have to be "covered" (diluting the topN budget),
+			// its sole dependents would be falsely exempt from cache-skip, and the CI
+			// "changed elements covered X/Y" line would count unchanged classes.
+			// When a class-level changed set exists it is authoritative (git/explicit
+			// source semantics) — intersect. When it is empty the structural member
+			// data is the only change signal (tiered/structural-only paths) and is
+			// taken as-is. The containment check is nested-aware: structural and
+			// bytecode-derived FQCNs can be nested binary names (com.Outer$Helper)
+			// while the class-level set carries the top-level (com.Outer), because
+			// git-level detection derives class names from file paths.
+			boolean intersectWithChangedClasses = changedClasses != null && !changedClasses.isEmpty();
 			for (String c : changedMembers.changedClasses()) {
-				if (!isTestClassName(c, knownTests)) {
-					universe.add(c);
+				if (isTestClassName(c, knownTests)) {
+					continue;
 				}
+				if (intersectWithChangedClasses && !DependencyMap.changedClassesContains(changedClasses, c)) {
+					continue;
+				}
+				universe.add(c);
 			}
 		}
 		Set<String> indexedChangedTests = new LinkedHashSet<>();
@@ -164,26 +185,49 @@ public final class CoverageClosure {
 			return new CoverageClosure(Set.of(), Map.of(), false);
 		}
 
+		// LOAD-BEARING: candidate discovery AND class-level overlap matching must
+		// see the TOP-LEVEL aliases of universe elements. Nested-class deps are
+		// indexed under both their binary name and their top-level class
+		// (DependencyMap#buildInvertedIndex), so a test that only depends on
+		// com.Outer is indexed under com.Outer — querying the exact binary name
+		// com.Outer$Helper would find no candidates, its sole coverer could never
+		// be force-included, and the element would be falsely reported uncovered
+		// (spurious WARN or coverage.enforce build failure). The same alias set is
+		// passed to computeOverlapClasses as the class-level match set:
+		// changedClassesContains only strips "$" from the DEP side, so a recorded
+		// dep com.Outer can never match the nested element directly — matching the
+		// top-level alias and resolving the raw dep back to the element via
+		// resolveToUniverse's top-level equivalence is what makes that branch
+		// reachable.
+		Set<String> candidateQuery = new LinkedHashSet<>(universe);
+		for (String element : universe) {
+			int dollar = element.indexOf('$');
+			if (dollar > 0) {
+				candidateQuery.add(element.substring(0, dollar));
+			}
+		}
+
 		// Candidates: tests reachable via the inverted index (handles the
 		// nested-class dep aliasing), plus indexed changed test classes — a changed
 		// test can still COVER production elements (via dep/member edges), it just
 		// never enters the universe and never covers itself.
-		Set<String> candidates = new LinkedHashSet<>(depMap.getAffectedTests(universe));
+		Set<String> candidates = new LinkedHashSet<>(depMap.getAffectedTests(candidateQuery));
 		candidates.addAll(indexedChangedTests);
 
-		boolean hasMemberDeps = depMap.hasMemberDeps();
+		// Only per-test-CLASS member data feeds getMemberDeps (DependencyMap reads
+		// memberDepsMap exclusively); an index with only per-test-METHOD member data
+		// degrades to class-level coverage sets just like an index without any
+		// member data.
+		boolean hasClassMemberDeps = depMap.hasClassMemberDeps();
 		Map<String, Set<String>> coverage = new LinkedHashMap<>();
 		for (String test : candidates) {
 			Set<String> deps = depMap.get(test);
-			Set<String> memberDeps = hasMemberDeps ? depMap.getMemberDeps(test) : null;
+			Set<String> memberDeps = hasClassMemberDeps ? depMap.getMemberDeps(test) : null;
 			Set<String> raw = StructuralChangeAnalyzer.computeOverlapClasses(deps, memberDeps, changedMembers,
-					universe);
+					candidateQuery);
 			Set<String> covered = new LinkedHashSet<>();
 			for (String dep : raw) {
-				String element = resolveToUniverse(dep, universe);
-				if (element != null) {
-					covered.add(element);
-				}
+				covered.addAll(resolveToUniverse(dep, universe, knownTests));
 			}
 			if (!covered.isEmpty()) {
 				coverage.put(test, covered);
@@ -191,10 +235,14 @@ public final class CoverageClosure {
 		}
 
 		// Precision notice data: the universe was derived from member-level change
-		// data, but the index has no MEMBER instrumentation, so coverage sets degrade
-		// to class-level overlap (computeOverlapClasses fallback branch).
+		// data, but the index has no per-test-CLASS MEMBER instrumentation, so
+		// coverage sets degrade to class-level overlap (computeOverlapClasses
+		// fallback branch). Per-test-METHOD-only member data does NOT help here:
+		// getMemberDeps reads the class-level map only, so the coverage sets are
+		// class-level and the notice must fire (a method-only index used to
+		// suppress it because hasMemberDeps() was true).
 		boolean memberPrecisionUnavailable = changedMembers != null && !changedMembers.changedMemberKeys().isEmpty()
-				&& !hasMemberDeps;
+				&& !hasClassMemberDeps;
 		// keep universe order for deterministic uncovered-element reporting
 		return new CoverageClosure(Collections.unmodifiableSet(universe), coverage, memberPrecisionUnavailable);
 	}
@@ -216,28 +264,44 @@ public final class CoverageClosure {
 
 	/**
 	 * Maps a test-side dependency name (possibly a nested class, e.g.
-	 * {@code com.Foo$Bar}) to the universe element it belongs to, or {@code null}
-	 * when it matches no universe element.
+	 * {@code com.Foo$Bar}) to the universe element(s) it belongs to, or an empty
+	 * set when it matches no universe element. A dep covers its exact universe
+	 * element, its top-level element, and — the top-level equivalence that makes
+	 * nested universe elements coverable at all — every universe element nested
+	 * under the dep's top-level class: a test depending on {@code com.Outer}
+	 * exercises {@code com.Outer$Helper} at class granularity, mirroring the
+	 * reverse direction {@code DependencyMap#buildInvertedIndex} already applies
+	 * when it indexes nested deps under their top-level class.
 	 */
-	private static String resolveToUniverse(String depName, Set<String> universe) {
+	private static Set<String> resolveToUniverse(String depName, Set<String> universe, Set<String> knownTests) {
+		// computeOverlapClasses can return test-class names (via
+		// changedMembers.changedClasses(), which the static call-graph expansion
+		// fills with test classes too); they can never be universe elements, so
+		// skip the O(|universe|) fallback scan for them — guaranteed miss.
+		if (isTestClassName(depName, knownTests)) {
+			return Set.of();
+		}
+		Set<String> result = null;
 		if (universe.contains(depName)) {
-			return depName;
+			result = new LinkedHashSet<>();
+			result.add(depName);
 		}
 		int dollar = depName.indexOf('$');
-		if (dollar > 0) {
-			String top = depName.substring(0, dollar);
-			if (universe.contains(top)) {
-				return top;
-			}
+		String top = dollar > 0 ? depName.substring(0, dollar) : depName;
+		if (dollar > 0 && universe.contains(top)) {
+			result = result == null ? new LinkedHashSet<>() : result;
+			result.add(top);
 		}
 		for (String element : universe) {
-			// universe element is a nested class of the dep name (rare: nested FQCN
-			// reported as changed while tests depend on the top-level class)
-			if (DependencyMap.changedClassesContains(Set.of(depName), element)) {
-				return element;
+			// universe element is a nested class of the dep's top-level (nested FQCN
+			// reported as changed while tests depend on the top-level class); the
+			// top-level-prefix comparison avoids a Set.of allocation per element
+			if (element.length() > top.length() && element.charAt(top.length()) == '$' && element.startsWith(top)) {
+				result = result == null ? new LinkedHashSet<>() : result;
+				result.add(element);
 			}
 		}
-		return null;
+		return result == null ? Set.of() : result;
 	}
 
 	/** True when there is no universe (no change signal) — closure is inert. */

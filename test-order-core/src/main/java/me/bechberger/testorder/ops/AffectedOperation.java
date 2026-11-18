@@ -184,8 +184,10 @@ public final class AffectedOperation {
 		}
 		// Coverage-closure outcome: WARN on uncovered changed elements; with
 		// coverageEnforce the build fails with an actionable message instead.
-		// Enforce-fails BEFORE the test lists are written so a failed-closure run
-		// never leaves a selected.txt that a subsequent CI step would consume.
+		// Full file contract: the throw happens BEFORE the fresh selected/remaining
+		// lists of THIS run are written, and any stale selected/remaining files from
+		// a PREVIOUS run are deleted first — so a failed-closure run leaves neither
+		// a fresh nor a stale list that a file-existence-keyed CI step could consume.
 		if (coverageStatus != null && coverageStatus.totalElements() > 0 && !coverageStatus.allCovered()) {
 			List<String> uncovered = coverageStatus.uncoveredElements();
 			String sample = uncovered.stream().limit(3).collect(java.util.stream.Collectors.joining(", "));
@@ -193,6 +195,7 @@ public final class AffectedOperation {
 			String summaryLine = coverageStatus.coveredCount() + "/" + coverageStatus.totalElements()
 					+ " changed elements are exercised by the selected test subset; " + uncovered.size() + " uncovered";
 			if (config.coverageEnforce()) {
+				deleteSelectionArtifacts(config);
 				throw new IllegalStateException("[test-order] Coverage closure failed: " + summaryLine + ". Uncovered: "
 						+ fullList + ". No selected test exercises these changed elements — the "
 						+ "dependency index may be stale (tests added/changed since the last learn phase). Run a "
@@ -298,5 +301,28 @@ public final class AffectedOperation {
 		SelectionSummary summary = SelectionSummary.from(selection, scoredCount, newCount, alwaysRunCount, fastCount,
 				coverageStatus);
 		return new SelectResult(selection, allSelected, summary, coverageStatus);
+	}
+
+	/**
+	 * Deletes the selected and remaining list files (from this or a previous run)
+	 * so a failed run — e.g. a coverage-enforce failure thrown before the fresh
+	 * lists are written — cannot leave file-existence-keyed CI consumers reading
+	 * outdated selections. Failures to delete are logged, not thrown: the enforce
+	 * failure itself must still surface.
+	 */
+	private static void deleteSelectionArtifacts(SelectConfig config) {
+		deleteQuietly(config.selectedFile(), config);
+		deleteQuietly(config.remainingFile(), config);
+	}
+
+	private static void deleteQuietly(Path file, SelectConfig config) {
+		if (file == null) {
+			return;
+		}
+		try {
+			java.nio.file.Files.deleteIfExists(file);
+		} catch (IOException e) {
+			config.log().warn("[test-order] Could not delete stale selection file " + file + ": " + e.getMessage());
+		}
 	}
 }

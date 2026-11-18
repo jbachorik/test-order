@@ -8,6 +8,7 @@ import java.util.Set;
 import org.apache.maven.plugin.MojoExecutionException;
 import org.apache.maven.plugins.annotations.*;
 
+import me.bechberger.testorder.CoverageClosure;
 import me.bechberger.testorder.DependencyMap;
 import me.bechberger.testorder.TieredTestSelector;
 import me.bechberger.testorder.ops.CiSummaryWriter;
@@ -153,7 +154,8 @@ public class TieredSelectMojo extends AbstractTestOrderMojo {
 			result = TieredSelectOperation.select(new TieredSelectOperation.TieredSelectConfig(analysis.depMap(),
 					analysis.state(), analysis.changedClasses(), analysis.changedTests(), analysis.weights(),
 					tier2Fraction, weightByDuration, alwaysRun, Path.of(tier1File), Path.of(tier2File),
-					Path.of(tier3File), pluginLog(), analysis.changedMembers(), coverageEnforce));
+					Path.of(tier3File), pluginLog(), analysis.changedMembers(), coverageEnforce,
+					analysis.staticAnalysisDegraded()));
 		} catch (IOException e) {
 			throw new MojoExecutionException("Failed to run tiered test selection", e);
 		}
@@ -238,14 +240,21 @@ public class TieredSelectMojo extends AbstractTestOrderMojo {
 			getLog().warn("Run: mvn test-order:run-tier test -Dtestorder.tiered.currentTier=3");
 		}
 
-		CiSummaryWriter
-				.writeSummary(
-						new CiSummaryWriter.SummaryInput(analysis.depMap().testClasses().size(), selection.tier1(),
-								java.util.stream.Stream.concat(selection.tier2().stream(), selection.tier3().stream())
-										.toList(),
-								analysis.changedClasses(), analysis.changedTests(), java.util.List.of(),
-								"tiered-select", 1, Path.of(project.getBuild().getDirectory())),
-						pluginLog());
+		// 12-arg SummaryInput: carry the tier-1 coverage-closure counts so the
+		// "Changed elements covered" row appears in the md/json summary (parity with
+		// the affected goal; the coverage status is available on the selection).
+		CoverageClosure.Status tier1Coverage = selection.coverageStatus();
+		Integer elementsTotal = tier1Coverage != null && tier1Coverage.totalElements() > 0
+				? tier1Coverage.totalElements()
+				: null;
+		Integer elementsCovered = elementsTotal != null ? tier1Coverage.coveredCount() : null;
+		Integer elementsUncovered = elementsTotal != null ? tier1Coverage.uncoveredElements().size() : null;
+		CiSummaryWriter.writeSummary(
+				new CiSummaryWriter.SummaryInput(analysis.depMap().testClasses().size(), selection.tier1(),
+						java.util.stream.Stream.concat(selection.tier2().stream(), selection.tier3().stream()).toList(),
+						analysis.changedClasses(), analysis.changedTests(), java.util.List.of(), "tiered-select", 1,
+						Path.of(project.getBuild().getDirectory()), elementsTotal, elementsCovered, elementsUncovered),
+				pluginLog());
 	}
 
 	/**

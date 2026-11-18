@@ -233,6 +233,31 @@ class AffectedWorkflowSelectAllTest {
 
 	// ── helpers ──────────────────────────────────────────────────────────────
 
+	/**
+	 * Pins the degraded seam: the select-all test above fabricates a
+	 * {@link ChangeAnalysis.Result} passing {@code true} as the 11th positional
+	 * argument. This pin asserts that position 10 (0-based) really is the
+	 * {@code staticAnalysisDegraded} record component — the field the degradation
+	 * gate in {@code ChangeAnalysis.analyze} writes — so a re-ordering or rename of
+	 * the record cannot silently detach the seam from the real trigger.
+	 */
+	@Test
+	void degradedSeamFlag_targetsTheAnalyzerWrittenStaticAnalysisDegradedComponent() {
+		java.lang.reflect.RecordComponent[] components = ChangeAnalysis.Result.class.getRecordComponents();
+		int degradedIndex = -1;
+		for (int i = 0; i < components.length; i++) {
+			if (components[i].getName().equals("staticAnalysisDegraded")) {
+				degradedIndex = i;
+				break;
+			}
+		}
+		assertTrue(degradedIndex >= 0,
+				"ChangeAnalysis.Result must expose a staticAnalysisDegraded component (the degradation gate writes it)");
+		assertEquals(10, degradedIndex,
+				"the hand-fabricated Result in staticAnalysisDegraded_selectsAllModuleTests passes the flag as the "
+						+ "11th positional argument — if the record component order changed, update the seam tests");
+	}
+
 	private static final class CapturingLog implements PluginLog {
 		final List<String> infos = new ArrayList<>();
 		final List<String> warns = new ArrayList<>();

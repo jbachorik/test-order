@@ -268,8 +268,8 @@ Changed files under `src/main/resources` / `src/test/resources` (any file type, 
 
 - Static analysis degraded (unreliable changed-element universe) → select-all for the module.
 - Cold start (no index yet) is unchanged: learn fallback / all tests run.
-- If the index has no `MEMBER` instrumentation data, the coverage closure runs at class-level precision (a notice is logged).
-- Affected-mode summaries include a `Changed elements covered: X/Y (+N uncovered)` line when coverage data is available.
+- If the index has no `MEMBER` instrumentation data, the coverage closure runs at class-level precision (an INFO-level message is logged).
+- Affected-mode CI summaries (Gradle `testOrderAffected` with `testorder.ci.summary=true`) include a `Changed elements covered: X/Y (+N uncovered)` line when coverage data is available.
 
 ---
 

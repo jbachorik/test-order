@@ -96,7 +96,9 @@ for the module.
 
 ```mermaid
 flowchart TD
-    A[Git diff / file hashes] -->|changed source classes| B[DependencyMap\ninverted index]
+    A[Git diff / file hashes\n+ non-source check] --> N{Non-source change?\nresources · build files}
+    N -->|yes| SA[Select ALL tests of the module\nWARN: module unselectable]
+    N -->|no| B[DependencyMap\ninverted index]
     B -->|sourceClass → Set of testClasses| C{Intersection\nnon-empty?}
     C -->|yes| D[Candidate affected tests]
     C -->|no| Z[Test skipped]
@@ -104,9 +106,7 @@ flowchart TD
     E -->|yes| F[Filter: test must use\na changed method or field]
     E -->|no| G[All candidates pass]
     F --> G
-    G --> N{Non-source change?\nresources · build files}
-    N -->|yes| SA[Select ALL tests of the module\nWARN: module unselectable]
-    N -->|no| K[Coverage closure\ngreedy cover core over\nchanged elements]
+    G --> K[Coverage closure\ngreedy cover core over\nchanged elements]
     K --> H[TestSelector\ncover core + greedy top-N + random-M]
     SA --> I[/"target/test-order-selected.txt"/]
     H --> I

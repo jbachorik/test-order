@@ -62,9 +62,13 @@ public final class CiSummaryWriter {
 	 * @param buildDir
 	 *            project build output directory
 	 * @param changedElementsTotal
-	 *            size of the coverage-closure universe (changed classes ∪ changed
-	 *            member keys); {@code null} when the workflow did not run the
-	 *            closure (the coverage line is then omitted from md/json)
+	 *            number of changed elements in the coverage-closure universe. The
+	 *            universe counts CLASSES (the changed production classes;
+	 *            member-level precision enters via the per-test coverage sets, not
+	 *            via member keys in the universe — see
+	 *            {@link me.bechberger.testorder.CoverageClosure}); {@code null}
+	 *            when the workflow did not run the closure (the coverage line is
+	 *            then omitted from md/json)
 	 * @param changedElementsCovered
 	 *            universe elements exercised by the selected subset; {@code null}
 	 *            when not provided

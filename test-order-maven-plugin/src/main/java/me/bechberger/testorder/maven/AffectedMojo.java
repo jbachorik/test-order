@@ -144,7 +144,10 @@ public class AffectedMojo extends AbstractTestOrderMojo {
 		AffectedOperation.SelectResult result;
 		me.bechberger.testorder.ops.workflows.ChangeAnalysis.Result analysis;
 		try {
-			AffectedWorkflow.SelectWithAnalysis combined = AffectedWorkflow.selectWithAnalysis(pctx);
+			// runRemaining gates the coverage-enforce fail path (parity with AutoWorkflow
+			// and the Gradle affected task): when the deferred tests run too (full suite),
+			// the closure check only reports — it must never fail the build.
+			AffectedWorkflow.SelectWithAnalysis combined = AffectedWorkflow.selectWithAnalysis(pctx, runRemaining);
 			result = combined.result();
 			analysis = combined.analysis();
 		} catch (IOException e) {

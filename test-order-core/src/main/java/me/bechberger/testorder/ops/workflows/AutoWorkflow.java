@@ -10,6 +10,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.Supplier;
 
+import me.bechberger.testorder.CoverageClosure;
 import me.bechberger.testorder.DependencyMap;
 import me.bechberger.testorder.TestOrderState;
 import me.bechberger.testorder.TestSelector;
@@ -182,7 +183,17 @@ public final class AutoWorkflow {
 		// re-detection). The structural analysis provides the member-level change
 		// universe the coverage-closure check needs.
 		ChangeAnalysis.Result a = ChangeAnalysis.analyze(ctx, new ChangeAnalysis.Options(true, true, false, true));
+		return execute(a);
+	}
 
+	/**
+	 * Selection part of {@link #execute()} over a precomputed change analysis.
+	 * Package-private seam for tests: lets a test fabricate a
+	 * {@link ChangeAnalysis.Result} (e.g. with {@code staticAnalysisDegraded=true})
+	 * without orchestrating the degradation gate end-to-end — same pattern as
+	 * {@code AffectedWorkflow#selectWithAnalysis(PluginContext, ChangeAnalysis.Result)}.
+	 */
+	Result execute(ChangeAnalysis.Result a) throws IOException {
 		var alwaysRun = AlwaysRunScanner.scanOrEmpty(ctx.testClassesDir());
 
 		// Augment changedTests with unindexed tests from testClassesDir (same logic as
@@ -224,8 +235,23 @@ public final class AutoWorkflow {
 					.warn("[test-order] Static analysis degraded — the changed-element universe is unreliable "
 							+ "(class-level fallback). Selecting ALL " + all.size()
 							+ " tests of this module (fail-safe select-all).\nRun: " + ctx.learnCommand());
-			selectResult = AffectedOperation.SelectResult
-					.of(new TestSelector.Selection(new java.util.ArrayList<>(all), java.util.List.of(), 0), true);
+			CoverageClosure closure = CoverageClosure.compute(effectiveDepMap, a.changedClasses(), changedAndNew,
+					a.changedMembers());
+			TestSelector.Selection selection = new TestSelector.Selection(new java.util.ArrayList<>(all),
+					java.util.List.of(), 0, java.util.List.of(), closure.status(all));
+			// Same uncovered-elements WARN as AffectedOperation (parity with the other
+			// select-all synthesis paths).
+			AffectedWorkflow.warnUncoveredElements(ctx, selection.coverageStatus());
+			// Parity with AffectedWorkflow.fullSelection: persist the selected list and
+			// remove a stale remaining file so run-remaining does not re-execute old
+			// deferrals and CI consumers of selected.txt see this run's full set.
+			if (ctx.selectedFile() != null) {
+				TestSelector.writeTestList(selection.selected(), ctx.selectedFile());
+			}
+			if (ctx.remainingFile() != null) {
+				Files.deleteIfExists(ctx.remainingFile());
+			}
+			selectResult = AffectedOperation.SelectResult.of(selection, true);
 		} else if (a.changedClasses().isEmpty() && changedAndNew.isEmpty() && ctx.topN() < 0 && ctx.randomM() == 0
 				&& !cacheConfig.enabled()) {
 			var allTests = new ArrayList<>(effectiveDepMap.testClasses());

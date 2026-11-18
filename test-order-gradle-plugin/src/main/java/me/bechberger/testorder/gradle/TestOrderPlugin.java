@@ -2021,18 +2021,24 @@ public class TestOrderPlugin implements Plugin<Project> {
                 try {
                     me.bechberger.testorder.ops.workflows.ChangeAnalysis.Result analysis =
                             me.bechberger.testorder.ops.workflows.ChangeAnalysis.analyze(
-                                    pctx, me.bechberger.testorder.ops.workflows.ChangeAnalysis.Options.FOR_SELECTION);
+                                    pctx, me.bechberger.testorder.ops.workflows.ChangeAnalysis.Options.FOR_SELECTION_DETAILED);
 
                     Path testClassesDir = resolveTestClassesDir(project);
                     Set<String> alwaysRun = me.bechberger.testorder.ops.AlwaysRunScanner.scan(testClassesDir);
 
+                    // Coverage-closure parity with Maven tiered-select: thread the
+                    // member universe + enforce flag (testorder.coverage.enforce) into
+                    // the tier-1 closure, and the degradation flag so a degraded
+                    // analysis falls back to select-all instead of enforcing on an
+                    // unreliable universe.
                     me.bechberger.testorder.ops.TieredSelectOperation.TieredSelectResult result =
                             me.bechberger.testorder.ops.TieredSelectOperation.select(
                                     new me.bechberger.testorder.ops.TieredSelectOperation.TieredSelectConfig(
                                             analysis.depMap(), analysis.state(), analysis.changedClasses(),
                                             analysis.changedTests(), analysis.weights(), tier2Fraction,
                                             weightByDuration, alwaysRun, tier1File, tier2File, tier3File,
-                                            wrapLog(project)));
+                                            wrapLog(project), analysis.changedMembers(),
+                                            pctx.coverageEnforce(), analysis.staticAnalysisDegraded()));
 
                     me.bechberger.testorder.TieredTestSelector.TieredSelection selection = result.selection();
 
@@ -2318,18 +2324,24 @@ public class TestOrderPlugin implements Plugin<Project> {
                 try {
                     me.bechberger.testorder.ops.workflows.ChangeAnalysis.Result analysis =
                             me.bechberger.testorder.ops.workflows.ChangeAnalysis.analyze(
-                                    pctx, me.bechberger.testorder.ops.workflows.ChangeAnalysis.Options.FOR_SELECTION);
+                                    pctx, me.bechberger.testorder.ops.workflows.ChangeAnalysis.Options.FOR_SELECTION_DETAILED);
 
                     Path testClassesDir = resolveTestClassesDir(project);
                     Set<String> alwaysRun = me.bechberger.testorder.ops.AlwaysRunScanner.scan(testClassesDir);
 
+                    // Coverage-closure parity with Maven tiered-select: thread the
+                    // member universe + enforce flag (testorder.coverage.enforce) into
+                    // the tier-1 closure, and the degradation flag so a degraded
+                    // analysis falls back to select-all instead of enforcing on an
+                    // unreliable universe.
                     me.bechberger.testorder.ops.TieredSelectOperation.TieredSelectResult result =
                             me.bechberger.testorder.ops.TieredSelectOperation.select(
                                     new me.bechberger.testorder.ops.TieredSelectOperation.TieredSelectConfig(
                                             analysis.depMap(), analysis.state(), analysis.changedClasses(),
                                             analysis.changedTests(), analysis.weights(), tier2Fraction,
                                             weightByDuration, alwaysRun, tier1File, tier2File, tier3File,
-                                            wrapLog(project)));
+                                            wrapLog(project), analysis.changedMembers(),
+                                            pctx.coverageEnforce(), analysis.staticAnalysisDegraded()));
 
                     me.bechberger.testorder.TieredTestSelector.TieredSelection selection = result.selection();
 
@@ -4099,10 +4111,91 @@ public class TestOrderPlugin implements Plugin<Project> {
             pctx.log().debug("[test-order] Non-source change detection skipped for change mode " + mode);
             return me.bechberger.testorder.changes.NonSourceChangeDetector.Detection.NOT_DETERMINED;
         }
-        // PluginContext.repoRoot is always set (root project directory); the detector
-        // fails safe to NOT_DETERMINED when git is unavailable.
+        // PluginContext.repoRoot is the ROOT PROJECT directory, which may be nested
+        // inside the git work tree (monorepo: repo/settings.gradle under repo/sub/).
+        // `git status --porcelain` prints work-tree-relative paths, so passing the
+        // root project dir would make every module-relative prefix mismatch and
+        // silently defeat non-source detection. Resolve the real work-tree top
+        // first; NOT_DETERMINED when git is unavailable/failed (treated as unchanged
+        // by the caller).
+        java.nio.file.Path workTreeTop = resolveWorkTreeTop(pctx.projectRoot());
+        if (workTreeTop == null) {
+            pctx.log().debug("[test-order] Non-source change detection skipped: git work-tree root unavailable");
+            return me.bechberger.testorder.changes.NonSourceChangeDetector.Detection.NOT_DETERMINED;
+        }
         return me.bechberger.testorder.changes.NonSourceChangeDetector.detect(
-                pctx.projectRoot(), pctx.repoRoot(), mode == me.bechberger.testorder.changes.ChangeDetector.Mode.SINCE_LAST_COMMIT);
+                pctx.projectRoot(), workTreeTop, mode == me.bechberger.testorder.changes.ChangeDetector.Mode.SINCE_LAST_COMMIT);
+    }
+
+    /** Cache of project dir → git work-tree top (same keying as core ChangeDetector). */
+    private static final java.util.concurrent.ConcurrentHashMap<Path, Path> workTreeTopCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Resolves the real git work-tree top via {@code git rev-parse --show-toplevel}
+     * (mirrors core {@code ChangeDetector.resolveGitRoot}, including the drain
+     * thread, the GitTimeout budget, and the destroyForcibly + drainer interrupt
+     * cleanup on the interrupted path). Returns {@code null} when git is
+     * unavailable or fails — the caller then treats non-source detection as
+     * NOT_DETERMINED (unchanged).
+     */
+    private static Path resolveWorkTreeTop(Path projectRoot) {
+        if (projectRoot == null) {
+            return null;
+        }
+        Path normalized = projectRoot.toAbsolutePath().normalize();
+        Path cached = workTreeTopCache.get(normalized);
+        if (cached != null) {
+            return cached;
+        }
+        Process process = null;
+        Thread drainer = null;
+        try {
+            ProcessBuilder pb = new ProcessBuilder("git", "rev-parse", "--show-toplevel");
+            pb.directory(normalized.toFile());
+            pb.redirectErrorStream(true);
+            process = pb.start();
+            final Process proc = process;
+            java.util.concurrent.atomic.AtomicReference<String> outputRef =
+                    new java.util.concurrent.atomic.AtomicReference<>("");
+            drainer = new Thread(() -> {
+                try (var is = proc.getInputStream()) {
+                    outputRef.set(new String(is.readAllBytes()).trim());
+                } catch (IOException ignored) {
+                }
+            }, "test-order-gradle-git-root-drain");
+            drainer.setDaemon(true);
+            drainer.start();
+            if (!process.waitFor(me.bechberger.testorder.changes.GitTimeout.seconds(),
+                    java.util.concurrent.TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                drainer.interrupt();
+                return null;
+            }
+            drainer.join(2000);
+            if (drainer.isAlive()) {
+                // Drain thread still running: output may be truncated — fail safe.
+                return null;
+            }
+            String output = outputRef.get();
+            if (process.exitValue() == 0 && !output.isEmpty()) {
+                Path top = Path.of(output).toAbsolutePath().normalize();
+                workTreeTopCache.put(normalized, top);
+                return top;
+            }
+            return null;
+        } catch (IOException e) {
+            return null;
+        } catch (InterruptedException e) {
+            if (process != null) {
+                process.destroyForcibly();
+            }
+            if (drainer != null) {
+                drainer.interrupt();
+            }
+            Thread.currentThread().interrupt();
+            return null;
+        }
     }
 
     /**

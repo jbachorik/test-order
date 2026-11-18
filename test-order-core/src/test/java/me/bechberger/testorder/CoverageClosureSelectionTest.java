@@ -348,6 +348,33 @@ class CoverageClosureSelectionTest {
 		assertTrue(ex.getMessage().contains("Coverage closure failed"), ex.getMessage());
 		assertTrue(ex.getMessage().contains("com.example.A"), "must list uncovered elements: " + ex.getMessage());
 		assertTrue(ex.getMessage().contains("testorder.coverage.enforce"), "must be actionable: " + ex.getMessage());
+		// enforce must fire BEFORE the fresh lists of this run are written
+		assertFalse(java.nio.file.Files.exists(tempDir.resolve("sel6.txt")),
+				"a failed-closure run must not write the selected list");
+		assertFalse(java.nio.file.Files.exists(tempDir.resolve("rem6.txt")),
+				"a failed-closure run must not write the remaining list");
+	}
+
+	@Test
+	void enforceFail_deletesStaleSelectionArtifacts() throws IOException {
+		// stale lists from a PREVIOUS run must be deleted before the enforce throw,
+		// so a file-existence-keyed CI step cannot consume outdated selections
+		DependencyMap depMap = memberPrecisionDepMap();
+		depMap.putMemberDeps("com.example.DTest", Set.of("com.example.C#x"));
+		TestOrderState state = new TestOrderState();
+		CapturingLog log = new CapturingLog();
+		java.nio.file.Files.write(tempDir.resolve("sel6.txt"), "com.example.Stale\n".getBytes());
+		java.nio.file.Files.write(tempDir.resolve("rem6.txt"), "com.example.Stale\n".getBytes());
+
+		AffectedOperation.SelectConfig config = new AffectedOperation.SelectConfig(depMap, state,
+				Set.of("com.example.A"), Set.of(), state.weights(), -1, 0, null, Set.of(), tempDir.resolve("sel6.txt"),
+				tempDir.resolve("rem6.txt"), log, null, TestSelector.CacheConfig.DISABLED, changedMethodM(), true);
+
+		assertThrows(IllegalStateException.class, () -> AffectedOperation.select(config));
+		assertFalse(java.nio.file.Files.exists(tempDir.resolve("sel6.txt")),
+				"stale selected list must be deleted on enforce failure");
+		assertFalse(java.nio.file.Files.exists(tempDir.resolve("rem6.txt")),
+				"stale remaining list must be deleted on enforce failure");
 	}
 
 	@Test
@@ -387,5 +414,123 @@ class CoverageClosureSelectionTest {
 		// no universe: legacy behavior preserved, zero coverage counts
 		assertEquals(0, result.summary().elementsTotal());
 		assertTrue(result.coverageStatus() == null || result.coverageStatus().totalElements() == 0);
+	}
+
+	@Test
+	void precisionNotice_loggedWhenOnlyMethodLevelMemberData() throws IOException {
+		// getMemberDeps reads ONLY the per-test-CLASS member map; an index with only
+		// per-test-METHOD member data (hasMemberDeps()=true, memberDepsMap empty)
+		// degrades to class-level coverage sets — the precision notice must still
+		// fire (it was suppressed before, hiding the precision loss).
+		DependencyMap methodOnly = new DependencyMap();
+		methodOnly.put("com.example.ATest", Set.of("com.example.A"));
+		methodOnly.put("com.example.BTest", Set.of("com.example.B"));
+		methodOnly.putMethodMemberDeps("com.example.ATest#t", Set.of("com.example.A#other"));
+		methodOnly.putMethodMemberDeps("com.example.BTest#t", Set.of("com.example.B#x"));
+		TestOrderState state = new TestOrderState();
+		CapturingLog log = new CapturingLog();
+
+		AffectedOperation.SelectConfig config = new AffectedOperation.SelectConfig(methodOnly, state,
+				Set.of("com.example.A"), Set.of(), state.weights(), -1, 0, null, Set.of(), tempDir.resolve("sel9.txt"),
+				tempDir.resolve("rem9.txt"), log, null, TestSelector.CacheConfig.DISABLED, changedMethodM(), false);
+
+		AffectedOperation.SelectResult result = AffectedOperation.select(config);
+
+		assertTrue(log.infos.stream().anyMatch(i -> i.contains("class-level precision")),
+				"precision notice expected for method-only member data, infos=" + log.infos);
+		// class-level fallback: ATest covers com.A
+		assertTrue(result.coverageStatus().allCovered());
+	}
+
+	// ════════════════════════════════════════════════════════════
+	// Universe hygiene: nested elements + expansion-reached callers
+	// ════════════════════════════════════════════════════════════
+
+	@Test
+	void nestedClassUniverseElement_topLevelDepIsCandidateAndCoverer() throws IOException {
+		// changed NESTED class (com.example.Outer$Helper) while the test's recorded
+		// dep is only the top-level class (com.example.Outer). The inverted index
+		// stores the dep under com.Outer, so candidate discovery and class-level
+		// overlap must go through the top-level alias — otherwise the sole coverer
+		// is invisible and the element is falsely reported uncovered (spurious WARN
+		// or coverage.enforce build failure).
+		DependencyMap depMap = new DependencyMap();
+		depMap.put("com.example.OuterTest", Set.of("com.example.Outer"));
+		depMap.put("com.example.OtherTest", Set.of("com.example.Unrelated"));
+		TestOrderState state = new TestOrderState();
+		CapturingLog log = new CapturingLog();
+
+		AffectedOperation.SelectConfig config = new AffectedOperation.SelectConfig(depMap, state,
+				Set.of("com.example.Outer$Helper"), Set.of(), state.weights(), 1, 0, null, Set.of(),
+				tempDir.resolve("selN.txt"), tempDir.resolve("remN.txt"), log, null, TestSelector.CacheConfig.DISABLED,
+				null, false);
+
+		AffectedOperation.SelectResult result = AffectedOperation.select(config);
+
+		assertEquals(1, result.coverageStatus().totalElements());
+		assertTrue(result.coverageStatus().allCovered(), "top-level dep must cover the nested element, uncovered="
+				+ result.coverageStatus().uncoveredElements());
+		assertTrue(result.selection().selected().contains("com.example.OuterTest"),
+				"sole coverer via top-level dep must be force-included, selected=" + result.selection().selected());
+	}
+
+	@Test
+	void nestedClassUniverseElement_structuralOnly_coverCoreFound() {
+		// tiered/structural-only path: changedClasses empty, the nested class enters
+		// the universe via changedMembers — the top-level dep must still cover it
+		DependencyMap depMap = new DependencyMap();
+		depMap.put("com.example.OuterTest", Set.of("com.example.Outer"));
+		ChangedMembers members = nestedHelperChanged();
+
+		CoverageClosure closure = CoverageClosure.compute(depMap, Set.of(), Set.of(), members);
+
+		assertEquals(Set.of("com.example.Outer$Helper"), closure.universe());
+		assertEquals(List.of("com.example.OuterTest"), closure.coverCore(),
+				"the top-level-dep test must be discovered as the sole coverer");
+		assertTrue(closure.status(List.of("com.example.OuterTest")).allCovered());
+	}
+
+	private static ChangedMembers nestedHelperChanged() {
+		Map<String, Set<String>> byClass = Map.of("com.example.Outer$Helper", Set.of("m"));
+		return new ChangedMembers(Set.of("com.example.Outer$Helper"), Set.of("com.example.Outer$Helper#m"), byClass,
+				Set.of(), Set.of(), Map.of("com.example.Outer$Helper#m", ChangeKind.BODY));
+	}
+
+	@Test
+	void expansionReachedUnchangedCaller_excludedFromUniverse() {
+		// the static call-graph expansion reached com.example.UnchangedCaller (a
+		// caller of com.example.A) but the class did NOT change; the class-level
+		// changed set is authoritative and must win — an unchanged caller must not
+		// become a universe element (cover-core inflation, false sole coverers)
+		DependencyMap depMap = new DependencyMap();
+		depMap.put("com.example.ATest", Set.of("com.example.A"));
+		depMap.put("com.example.CallersTest", Set.of("com.example.UnchangedCaller"));
+		Map<String, Set<String>> byClass = Map.of("com.example.A", Set.of("m"), "com.example.UnchangedCaller",
+				Set.of("<class>"));
+		ChangedMembers expanded = new ChangedMembers(Set.of("com.example.A", "com.example.UnchangedCaller"),
+				Set.of("com.example.A#m", "com.example.UnchangedCaller#<class>"), byClass, Set.of(), Set.of(),
+				Map.of("com.example.A#m", ChangeKind.BODY));
+
+		CoverageClosure closure = CoverageClosure.compute(depMap, Set.of("com.example.A"), Set.of(), expanded);
+
+		assertEquals(Set.of("com.example.A"), closure.universe(),
+				"expansion-reached caller classes that did not change must not be universe elements");
+	}
+
+	@Test
+	void nestedStructuralClass_keptWhenTopLevelChanged() {
+		// git-level detection derives class names from file paths (top-level),
+		// while structural FQCNs can be nested — the universe intersection must be
+		// nested-aware or genuinely changed nested classes would be dropped
+		DependencyMap depMap = new DependencyMap();
+		depMap.put("com.example.OuterTest", Set.of("com.example.Outer"));
+		ChangedMembers members = nestedHelperChanged();
+
+		CoverageClosure closure = CoverageClosure.compute(depMap, Set.of("com.example.Outer"), Set.of(), members);
+
+		assertEquals(Set.of("com.example.Outer", "com.example.Outer$Helper"), closure.universe(),
+				"nested structural class must survive intersection with the top-level changed set");
+		// the top-level dep covers both elements (exact + nested under top-level)
+		assertTrue(closure.status(List.of("com.example.OuterTest")).allCovered());
 	}
 }

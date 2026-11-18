@@ -2,6 +2,7 @@ package me.bechberger.testorder.ops.workflows;
 
 import java.io.IOException;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Set;
 
 import me.bechberger.testorder.CoverageClosure;
@@ -47,13 +48,56 @@ public final class AffectedWorkflow {
 	/**
 	 * Runs the full selection workflow and returns both the selection result and
 	 * the change analysis result (R7-13: avoids double change detection).
+	 *
+	 * <p>
+	 * Coverage-enforce gate: {@code runRemaining=true} means the caller also runs
+	 * the deferred tests (full suite), so the closure check must never fail —
+	 * parity with {@link AutoWorkflow}. The affected default is
+	 * {@code runRemaining=false}: the deferred tests do NOT run in the same build,
+	 * so the enforce fail path applies.
 	 */
 	public static SelectWithAnalysis selectWithAnalysis(PluginContext ctx) throws IOException {
+		return selectWithAnalysis(ctx, false);
+	}
+
+	/**
+	 * As {@link #selectWithAnalysis(PluginContext)} with the run-remaining flag for
+	 * the coverage-enforce gate.
+	 */
+	public static SelectWithAnalysis selectWithAnalysis(PluginContext ctx, boolean runRemaining) throws IOException {
+		// ── Fail-safe select-all trigger (cheap check FIRST) ──────
+		// Non-source changes (resources, build files) make the module unselectable
+		// via source-based change detection. The git-based check needs neither the
+		// index nor the analysis, so run it BEFORE the expensive member-level
+		// analysis: when select-all triggers, only the reduced class-level analysis
+		// runs (the structural/member detail is discarded on select-all anyway).
+		// NOT_DETERMINED is treated as unchanged (pre-existing behavior when git is
+		// unavailable).
+		NonSourceChangeDetector.Detection nonSource = detectNonSourceChanges(ctx);
+		if (nonSource != null && nonSource.changed()) {
+			ctx.log().warn("[test-order] Non-source change detected — module behavior may change without a "
+					+ "source-level change signal. Matched files: " + String.join(", ", nonSource.files()));
+			// Reduced analysis: class-level universe only — enough for the closure
+			// status and the orderer config, without the structural/member work the
+			// select-all path would discard.
+			ChangeAnalysis.Result a = ChangeAnalysis.analyze(ctx, ChangeAnalysis.Options.FOR_SELECTION);
+			ModuleScope scope = moduleScope(ctx, a);
+			return new SelectWithAnalysis(fullSelection(ctx, a, scope.effectiveDepMap(), scope.changedAndNew(),
+					"selecting ALL " + fullTestCount(scope.effectiveDepMap(), scope.changedAndNew())
+							+ " tests of this module (select-all; module is unselectable via source-based "
+							+ "change detection)"),
+					a);
+		}
+
 		// FOR_SELECTION_DETAILED: member-level change universe for cover-core
 		// selection (structural analysis + method detection), still module-filtered
 		// and read-only. See ChangeAnalysis.Options.FOR_SELECTION_DETAILED.
 		ChangeAnalysis.Result a = ChangeAnalysis.analyze(ctx, ChangeAnalysis.Options.FOR_SELECTION_DETAILED);
-		return selectWithAnalysis(ctx, a);
+		return selectWithAnalysis(ctx, a, runRemaining);
+	}
+
+	static SelectWithAnalysis selectWithAnalysis(PluginContext ctx, ChangeAnalysis.Result a) throws IOException {
+		return selectWithAnalysis(ctx, a, false);
 	}
 
 	/**
@@ -62,9 +106,48 @@ public final class AffectedWorkflow {
 	 * {@code staticAnalysisDegraded=true}, without orchestrating the degradation
 	 * gate end-to-end).
 	 */
-	static SelectWithAnalysis selectWithAnalysis(PluginContext ctx, ChangeAnalysis.Result a) throws IOException {
+	static SelectWithAnalysis selectWithAnalysis(PluginContext ctx, ChangeAnalysis.Result a, boolean runRemaining)
+			throws IOException {
+		ModuleScope scope = moduleScope(ctx, a);
+
+		// ── Fail-safe select-all trigger ───────────────────────────
+		// The degraded trigger bypasses TestSelector entirely: the changed-element
+		// universe is unreliable (static analysis degraded), so the only safe subset
+		// is ALL tests of the module. (The non-source trigger runs earlier — before
+		// the analysis — see selectWithAnalysis(PluginContext, boolean).)
+		if (a.staticAnalysisDegraded()) {
+			ctx.log().warn("[test-order] Static analysis degraded — the changed-element universe is unreliable "
+					+ "(class-level fallback).\nRun: " + ctx.learnCommand());
+			return new SelectWithAnalysis(fullSelection(ctx, a, scope.effectiveDepMap(), scope.changedAndNew(),
+					"selecting ALL " + fullTestCount(scope.effectiveDepMap(), scope.changedAndNew())
+							+ " tests of this module (fail-safe select-all)"),
+					a);
+		}
+
 		var alwaysRun = AlwaysRunScanner.scanOrEmpty(ctx.testClassesDir());
 
+		me.bechberger.testorder.TestSelector.CacheConfig cacheConfig = AutoWorkflow.readCacheConfig(ctx.stateFile());
+		// Coverage-enforce gate (parity with AutoWorkflow): when the caller also runs
+		// the deferred tests (runRemaining=true, full suite) the closure check must
+		// never fail — it only reports covered X/Y.
+		boolean coverageEnforce = ctx.coverageEnforce() && !runRemaining;
+		AffectedOperation.SelectResult result = AffectedOperation.select(new AffectedOperation.SelectConfig(
+				scope.effectiveDepMap(), a.state(), a.changedClasses(), scope.changedAndNew(), a.weights(), ctx.topN(),
+				ctx.randomM(), ctx.seed(), alwaysRun, ctx.selectedFile(), ctx.remainingFile(), ctx.log(),
+				a.changeComplexity(), cacheConfig, a.changedMembers(), coverageEnforce));
+		return new SelectWithAnalysis(result, a);
+	}
+
+	/** Module-filtered dep map plus the augmented changed/new test set. */
+	private record ModuleScope(DependencyMap effectiveDepMap, Set<String> changedAndNew) {
+	}
+
+	/**
+	 * Augments {@code changedTests} with unindexed tests from
+	 * {@code testClassesDir} and applies the multi-module filter — shared by every
+	 * selection path.
+	 */
+	private static ModuleScope moduleScope(PluginContext ctx, ChangeAnalysis.Result a) {
 		// Include tests discovered from testClassesDir that are not yet in the dep map
 		// as "changedTests" so the selector treats them as new and selects them.
 		// This handles modules whose tests haven't been learned yet (e.g., a submodule
@@ -102,37 +185,7 @@ public final class AffectedWorkflow {
 						+ "' produced an empty dep map — skipping module filter to avoid empty selection.");
 			}
 		}
-
-		// ── Fail-safe select-all triggers ───────────────────────────
-		// Both triggers bypass TestSelector entirely: the source-based change signal
-		// is either invisible (non-source inputs changed) or unreliable (static
-		// analysis degraded), so the only safe subset is ALL tests of the module.
-		// NOT_DETERMINED from the non-source detector is treated as unchanged
-		// (pre-existing behavior when git is unavailable).
-		NonSourceChangeDetector.Detection nonSource = detectNonSourceChanges(ctx);
-		if (nonSource != null && nonSource.changed()) {
-			ctx.log().warn("[test-order] Non-source change detected — module behavior may change without a "
-					+ "source-level change signal. Matched files: " + String.join(", ", nonSource.files()));
-			return new SelectWithAnalysis(fullSelection(ctx, a, effectiveDepMap, changedAndNew,
-					"selecting ALL " + fullTestCount(effectiveDepMap, changedAndNew)
-							+ " tests of this module (select-all; module is unselectable via source-based "
-							+ "change detection)"),
-					a);
-		}
-		if (a.staticAnalysisDegraded()) {
-			ctx.log().warn("[test-order] Static analysis degraded — the changed-element universe is unreliable "
-					+ "(class-level fallback).\nRun: " + ctx.learnCommand());
-			return new SelectWithAnalysis(fullSelection(ctx, a, effectiveDepMap, changedAndNew, "selecting ALL "
-					+ fullTestCount(effectiveDepMap, changedAndNew) + " tests of this module (fail-safe select-all)"),
-					a);
-		}
-
-		me.bechberger.testorder.TestSelector.CacheConfig cacheConfig = AutoWorkflow.readCacheConfig(ctx.stateFile());
-		AffectedOperation.SelectResult result = AffectedOperation.select(new AffectedOperation.SelectConfig(
-				effectiveDepMap, a.state(), a.changedClasses(), changedAndNew, a.weights(), ctx.topN(), ctx.randomM(),
-				ctx.seed(), alwaysRun, ctx.selectedFile(), ctx.remainingFile(), ctx.log(), a.changeComplexity(),
-				cacheConfig, a.changedMembers(), ctx.coverageEnforce()));
-		return new SelectWithAnalysis(result, a);
+		return new ModuleScope(effectiveDepMap, changedAndNew);
 	}
 
 	/** Number of tests a select-all run would execute (indexed + new). */
@@ -161,6 +214,9 @@ public final class AffectedWorkflow {
 				a.changedMembers());
 		TestSelector.Selection selection = new TestSelector.Selection(new java.util.ArrayList<>(all),
 				java.util.List.of(), 0, java.util.List.of(), closure.status(all));
+		// Same uncovered-elements WARN as AffectedOperation: even a select-all set can
+		// leave changed elements unexercised when the dependency index is stale.
+		warnUncoveredElements(ctx, selection.coverageStatus());
 		// Parity with AffectedOperation.select: persist the selected list and remove a
 		// stale remaining file so run-remaining does not re-execute old deferrals.
 		if (ctx.selectedFile() != null) {
@@ -170,6 +226,24 @@ public final class AffectedWorkflow {
 			java.nio.file.Files.deleteIfExists(ctx.remainingFile());
 		}
 		return AffectedOperation.SelectResult.of(selection, true);
+	}
+
+	/**
+	 * Same uncovered-elements WARN as {@code AffectedOperation.select} — shared by
+	 * every select-all synthesis path in this package.
+	 */
+	static void warnUncoveredElements(PluginContext ctx, CoverageClosure.Status status) {
+		if (status == null || status.totalElements() <= 0 || status.allCovered()) {
+			return;
+		}
+		List<String> uncovered = status.uncoveredElements();
+		String sample = uncovered.stream().limit(3).collect(java.util.stream.Collectors.joining(", "));
+		String fullList = String.join(", ", uncovered);
+		ctx.log()
+				.warn("[test-order] Coverage closure: " + status.coveredCount() + "/" + status.totalElements()
+						+ " changed elements are exercised by the selected test subset; " + uncovered.size()
+						+ " uncovered" + " (e.g. " + sample + "). Uncovered: " + fullList
+						+ ". Consider a learn phase (mvn test -Dtestorder.mode=learn) or running the full suite.");
 	}
 
 	/**
@@ -218,15 +292,18 @@ public final class AffectedWorkflow {
 		}
 		// Fall back to ChangeDetector-style resolution so submodule builds get
 		// repo-root-relative path matching.
+		Process process = null;
+		Thread drainer = null;
 		try {
 			ProcessBuilder pb = new ProcessBuilder("git", "rev-parse", "--show-toplevel");
 			pb.directory(ctx.projectRoot().toFile());
 			pb.redirectErrorStream(true);
-			Process process = pb.start();
+			process = pb.start();
+			final Process proc = process;
 			java.util.concurrent.atomic.AtomicReference<String> outputRef = new java.util.concurrent.atomic.AtomicReference<>(
 					"");
-			Thread drainer = new Thread(() -> {
-				try (var is = process.getInputStream()) {
+			drainer = new Thread(() -> {
+				try (var is = proc.getInputStream()) {
 					outputRef.set(new String(is.readAllBytes()).trim());
 				} catch (IOException ignored) {
 				}
@@ -240,6 +317,10 @@ public final class AffectedWorkflow {
 				return null;
 			}
 			drainer.join(2000);
+			if (drainer.isAlive()) {
+				// Drain thread still running: output may be truncated — fail safe.
+				return null;
+			}
 			String output = outputRef.get();
 			if (process.exitValue() == 0 && !output.isEmpty()) {
 				return java.nio.file.Path.of(output).toAbsolutePath().normalize();
@@ -248,6 +329,14 @@ public final class AffectedWorkflow {
 		} catch (IOException e) {
 			return null;
 		} catch (InterruptedException e) {
+			// Mirror GitSupport.runGit: kill the process and unblock the drainer so a
+			// cancelled build does not leak an orphaned git process holding a pipe.
+			if (process != null) {
+				process.destroyForcibly();
+			}
+			if (drainer != null) {
+				drainer.interrupt();
+			}
 			Thread.currentThread().interrupt();
 			return null;
 		}

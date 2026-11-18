@@ -30,11 +30,20 @@ public final class TieredSelectOperation {
 	private TieredSelectOperation() {
 	}
 
-	/** Input configuration for tiered test selection. */
+	/**
+	 * Input configuration for tiered test selection.
+	 *
+	 * @param staticAnalysisDegraded
+	 *            {@code true} when the caller's change analysis reported a degraded
+	 *            static-analysis universe; {@code select} then synthesizes a
+	 *            module-wide select-all (everything in tier 1, tiers 2/3 empty) and
+	 *            never applies {@code coverageEnforce} — parity with the
+	 *            affected/auto workflows' fail-safe select-all
+	 */
 	public record TieredSelectConfig(DependencyMap depMap, TestOrderState state, Set<String> changedClasses,
 			Set<String> changedTests, TestOrderState.ScoringWeights weights, double tier2Fraction,
 			boolean weightByDuration, Set<String> alwaysRunClasses, Path tier1File, Path tier2File, Path tier3File,
-			PluginLog log, ChangedMembers changedMembers, boolean coverageEnforce) {
+			PluginLog log, ChangedMembers changedMembers, boolean coverageEnforce, boolean staticAnalysisDegraded) {
 
 		/** Backward-compatible constructor without coverage-closure wiring. */
 		public TieredSelectConfig(DependencyMap depMap, TestOrderState state, Set<String> changedClasses,
@@ -42,7 +51,16 @@ public final class TieredSelectOperation {
 				boolean weightByDuration, Set<String> alwaysRunClasses, Path tier1File, Path tier2File, Path tier3File,
 				PluginLog log) {
 			this(depMap, state, changedClasses, changedTests, weights, tier2Fraction, weightByDuration,
-					alwaysRunClasses, tier1File, tier2File, tier3File, log, null, false);
+					alwaysRunClasses, tier1File, tier2File, tier3File, log, null, false, false);
+		}
+
+		/** Backward-compatible constructor without the degradation flag. */
+		public TieredSelectConfig(DependencyMap depMap, TestOrderState state, Set<String> changedClasses,
+				Set<String> changedTests, TestOrderState.ScoringWeights weights, double tier2Fraction,
+				boolean weightByDuration, Set<String> alwaysRunClasses, Path tier1File, Path tier2File, Path tier3File,
+				PluginLog log, ChangedMembers changedMembers, boolean coverageEnforce) {
+			this(depMap, state, changedClasses, changedTests, weights, tier2Fraction, weightByDuration,
+					alwaysRunClasses, tier1File, tier2File, tier3File, log, changedMembers, coverageEnforce, false);
 		}
 	}
 
@@ -74,6 +92,9 @@ public final class TieredSelectOperation {
 	 *             if writing tier files fails
 	 */
 	public static TieredSelectResult select(TieredSelectConfig config) throws IOException {
+		if (config.staticAnalysisDegraded()) {
+			return degradedSelectAll(config);
+		}
 		CoverageClosure closure = CoverageClosure.compute(config.depMap(), config.changedClasses(),
 				config.changedTests(), config.changedMembers());
 		TieredTestSelector.TieredSelection selection = new TieredTestSelector(config.depMap(), config.state(),
@@ -118,5 +139,54 @@ public final class TieredSelectOperation {
 						+ " tier-3 (rest)" + coverageSummary);
 
 		return new TieredSelectResult(selection);
+	}
+
+	/**
+	 * Fail-safe select-all for a degraded static-analysis universe: ALL tests of
+	 * the module run in tier 1 (tiers 2/3 empty), the coverage status is computed
+	 * over the full set so the summary line stays visible, and
+	 * {@code coverageEnforce} is deliberately NOT applied — an unreliable universe
+	 * must fail safe (select-all), not fail closed. Same synthesis as
+	 * {@code AffectedWorkflow#fullSelection}.
+	 */
+	private static TieredSelectResult degradedSelectAll(TieredSelectConfig config) throws IOException {
+		java.util.LinkedHashSet<String> all = new java.util.LinkedHashSet<>(config.depMap().testClasses());
+		all.addAll(config.changedTests());
+		if (config.coverageEnforce()) {
+			config.log().info("[test-order] testorder.coverage.enforce requested but the static analysis is degraded — "
+					+ "enforcement is skipped (fail-safe select-all applies instead).");
+		}
+		config.log()
+				.warn("[test-order] Static analysis degraded — the changed-element universe is unreliable "
+						+ "(class-level fallback). Selecting ALL " + all.size()
+						+ " tests of this module in tier 1 (fail-safe select-all; tiers 2/3 are empty).");
+		CoverageClosure closure = CoverageClosure.compute(config.depMap(), config.changedClasses(),
+				config.changedTests(), config.changedMembers());
+		CoverageClosure.Status status = closure.status(all);
+		warnUncoveredElements(config.log(), status);
+		TieredTestSelector.TieredSelection selection = new TieredTestSelector.TieredSelection(
+				new java.util.ArrayList<>(all), java.util.List.of(), java.util.List.of(), status);
+		TieredTestSelector.writeTierFiles(selection, config.tier1File(), config.tier2File(), config.tier3File());
+		config.log().info("[test-order] Tiered selection (degraded select-all): " + all.size()
+				+ " tier-1 (all module tests), 0 tier-2, 0 tier-3");
+		return new TieredSelectResult(selection);
+	}
+
+	/**
+	 * Same uncovered-elements WARN as the normal tier-1 closure check (and
+	 * {@code AffectedOperation}): even a select-all set can leave changed elements
+	 * unexercised when the dependency index is stale.
+	 */
+	static void warnUncoveredElements(PluginLog log, CoverageClosure.Status status) {
+		if (status == null || status.totalElements() <= 0 || status.allCovered()) {
+			return;
+		}
+		List<String> uncovered = status.uncoveredElements();
+		String sample = uncovered.stream().limit(3).collect(java.util.stream.Collectors.joining(", "));
+		String fullList = String.join(", ", uncovered);
+		log.warn("[test-order] Coverage closure: " + status.coveredCount() + "/" + status.totalElements()
+				+ " changed elements are exercised by the selected test subset; " + uncovered.size() + " uncovered"
+				+ " (e.g. " + sample + "). Uncovered: " + fullList
+				+ ". Consider a learn phase (mvn test -Dtestorder.mode=learn) or running the full suite.");
 	}
 }

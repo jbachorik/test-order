@@ -417,6 +417,54 @@ class TestOrderPluginIntegrationTest {
                 "Summary should carry the non-source select-all marker:\n" + json);
     }
 
+    @Test
+    @DisplayName("testOrderAffected with coverage.enforce fails when no test covers a changed class")
+    void affectedTaskEnforceFailsOnUncoveredChangedClass() throws Exception {
+        scaffoldProject();
+        runner("test", "-Dtestorder.mode=learn").build();
+
+        // 'Unknown' is an explicit changed class no test exercises — the closure
+        // reports it uncovered; enforce=true must fail the task (before the
+        // selected list is written).
+        BuildResult result = runner("testOrderAffected",
+                "-Dtestorder.changeMode=explicit",
+                "-Dtestorder.changed.classes=com.example.app.Unknown",
+                "-Dtestorder.affected.topN=1",
+                "-Dtestorder.affected.randomM=0",
+                "-Dtestorder.coverage.enforce=true").buildAndFail();
+
+        assertEquals(FAILED, result.task(":testOrderAffected").getOutcome());
+        assertTrue(result.getOutput().contains("Coverage closure failed"),
+                "Enforce failure must name the uncovered element:\n" + result.getOutput());
+        assertFalse(Files.exists(projectDir.resolve("build/test-order-selected.txt")),
+                "Enforce must fail BEFORE the selected list is written");
+    }
+
+    @Test
+    @DisplayName("testOrderAffected force-includes cover-core tests beyond the topN cap")
+    void affectedTaskCoverCoreSurvivesTopNCap() throws Exception {
+        scaffoldProject();
+        runner("test", "-Dtestorder.mode=learn").build();
+
+        // Both Calculator and StringUtils change; each is exercised by exactly one
+        // test class (sole coverer). With topN=1 a cap-only selection would run one
+        // test class; the cover core must force-include BOTH.
+        BuildResult result = runner("testOrderAffected",
+                "-Dtestorder.changeMode=explicit",
+                "-Dtestorder.changed.classes=com.example.app.Calculator,com.example.app.StringUtils",
+                "-Dtestorder.affected.topN=1",
+                "-Dtestorder.affected.randomM=0").build();
+
+        assertEquals(SUCCESS, result.task(":testOrderAffected").getOutcome());
+        List<String> selected = Files.readAllLines(projectDir.resolve("build/test-order-selected.txt")).stream()
+                .filter(l -> !l.isBlank() && !l.startsWith("#")).toList();
+        assertEquals(Set.of("com.example.app.CalculatorTest", "com.example.app.StringUtilsTest"),
+                Set.copyOf(selected),
+                "Cover core (both sole coverers) must survive topN=1, got: " + selected);
+        assertFalse(Files.exists(projectDir.resolve("build/test-order-remaining.txt")),
+                "Nothing is deferred when the cap-only remainder is empty");
+    }
+
     /** Runs a git command in the given directory, failing the test on non-zero exit. */
     private static void git(Path dir, String... args) throws Exception {
         java.util.List<String> cmd = new java.util.ArrayList<>();

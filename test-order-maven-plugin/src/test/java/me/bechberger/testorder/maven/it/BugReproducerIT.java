@@ -157,6 +157,11 @@ class BugReproducerIT {
 		long selectedCount = selected.lines().filter(l -> !l.isBlank()).count();
 		assertThat(selectedCount).as("topN=0 selects the cover core (1 test covering Product) + randomM (2)")
 				.isEqualTo(3);
+		// Cover-core identity (defense-in-depth): the force-included test must be the
+		// class exercising the changed Product (ProductTest) — a broken sole-coverer
+		// computation that force-included an unrelated test would still total 3.
+		assertThat(selected).as("cover core must be the test class exercising the changed Product")
+				.contains(PRODUCT_TEST);
 	}
 
 	// ═══════════════════════════════════════════════════════════════════
