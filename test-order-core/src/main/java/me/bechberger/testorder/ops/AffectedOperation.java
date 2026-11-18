@@ -7,9 +7,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import me.bechberger.testorder.CoverageClosure;
 import me.bechberger.testorder.DependencyMap;
 import me.bechberger.testorder.TestOrderState;
 import me.bechberger.testorder.TestSelector;
+import me.bechberger.testorder.changes.StructuralChangeAnalyzer.ChangedMembers;
 
 /**
  * Framework-agnostic test selection orchestration. Runs TestSelector and writes
@@ -24,7 +26,16 @@ public final class AffectedOperation {
 	public record SelectConfig(DependencyMap depMap, TestOrderState state, Set<String> changedClasses,
 			Set<String> changedTests, TestOrderState.ScoringWeights weights, int topN, int randomM, Long seed,
 			Set<String> alwaysRunClasses, Path selectedFile, Path remainingFile, PluginLog log,
-			Map<String, Double> changeComplexity, TestSelector.CacheConfig cacheConfig) {
+			Map<String, Double> changeComplexity, TestSelector.CacheConfig cacheConfig, ChangedMembers changedMembers,
+			boolean coverageEnforce) {
+		public SelectConfig(DependencyMap depMap, TestOrderState state, Set<String> changedClasses,
+				Set<String> changedTests, TestOrderState.ScoringWeights weights, int topN, int randomM, Long seed,
+				Set<String> alwaysRunClasses, Path selectedFile, Path remainingFile, PluginLog log,
+				Map<String, Double> changeComplexity, TestSelector.CacheConfig cacheConfig) {
+			this(depMap, state, changedClasses, changedTests, weights, topN, randomM, seed, alwaysRunClasses,
+					selectedFile, remainingFile, log, changeComplexity, cacheConfig, null, false);
+		}
+
 		public SelectConfig(DependencyMap depMap, TestOrderState state, Set<String> changedClasses,
 				Set<String> changedTests, TestOrderState.ScoringWeights weights, int topN, int randomM, Long seed,
 				Set<String> alwaysRunClasses, Path selectedFile, Path remainingFile, PluginLog log,
@@ -35,7 +46,13 @@ public final class AffectedOperation {
 	}
 
 	/** Result of test selection. */
-	public record SelectResult(TestSelector.Selection selection, boolean allSelected, SelectionSummary summary) {
+	public record SelectResult(TestSelector.Selection selection, boolean allSelected, SelectionSummary summary,
+			CoverageClosure.Status coverageStatus) {
+
+		/** Backward-compatible constructor without coverage status. */
+		public SelectResult(TestSelector.Selection selection, boolean allSelected, SelectionSummary summary) {
+			this(selection, allSelected, summary, selection.coverageStatus());
+		}
 
 		/**
 		 * Backward-compatible factory without summary (for synthesized full-run
@@ -51,7 +68,15 @@ public final class AffectedOperation {
 	 * plugins log {@link #format()} so the end-of-run summary is consistent.
 	 */
 	public record SelectionSummary(int selectedCount, int deferredCount, String topScorerName, int scoredCount,
-			int newCount, int alwaysRunCount, int fastCount, int cachedCount) {
+			int newCount, int alwaysRunCount, int fastCount, int cachedCount, int elementsTotal, int elementsCovered,
+			int elementsUncovered) {
+
+		/** Backward-compatible constructor without coverage-closure counts. */
+		public SelectionSummary(int selectedCount, int deferredCount, String topScorerName, int scoredCount,
+				int newCount, int alwaysRunCount, int fastCount, int cachedCount) {
+			this(selectedCount, deferredCount, topScorerName, scoredCount, newCount, alwaysRunCount, fastCount,
+					cachedCount, 0, 0, 0);
+		}
 
 		/**
 		 * Total tests in the index for this selection (selected + deferred + cached).
@@ -68,9 +93,17 @@ public final class AffectedOperation {
 
 		static SelectionSummary from(TestSelector.Selection selection, int scoredCount, int newCount,
 				int alwaysRunCount, int fastCount) {
+			return from(selection, scoredCount, newCount, alwaysRunCount, fastCount, selection.coverageStatus());
+		}
+
+		static SelectionSummary from(TestSelector.Selection selection, int scoredCount, int newCount,
+				int alwaysRunCount, int fastCount, CoverageClosure.Status coverageStatus) {
 			String top = selection.selected().isEmpty() ? null : selection.selected().get(0);
+			int total = coverageStatus == null ? 0 : coverageStatus.totalElements();
+			int covered = coverageStatus == null ? 0 : coverageStatus.coveredCount();
+			int uncovered = coverageStatus == null ? 0 : coverageStatus.uncoveredElements().size();
 			return new SelectionSummary(selection.selected().size(), selection.remaining().size(), top, scoredCount,
-					newCount, alwaysRunCount, fastCount, selection.cached().size());
+					newCount, alwaysRunCount, fastCount, selection.cached().size(), total, covered, uncovered);
 		}
 
 		/**
@@ -95,6 +128,12 @@ public final class AffectedOperation {
 				sb.append("\n[test-order] ").append(deferredCount).append(" deferred — see remaining-file");
 			if (cachedCount > 0)
 				sb.append("\n[test-order] ").append(cachedCount).append(" cached (skipped — unchanged + pass streak)");
+			if (elementsTotal > 0) {
+				sb.append("\n[test-order] Changed elements covered: ").append(elementsCovered).append("/")
+						.append(elementsTotal);
+				if (elementsUncovered > 0)
+					sb.append(" (+").append(elementsUncovered).append(" uncovered)");
+			}
 			sb.append("\n[test-order] Run `").append(buildSystem.showCommand()).append("` for the full ranking, or `")
 					.append(buildSystem.dashboardCommand()).append("` for HTML.");
 			return sb.toString();
@@ -129,11 +168,42 @@ public final class AffectedOperation {
 			}
 		}
 
+		CoverageClosure closure = CoverageClosure.compute(config.depMap(), config.changedClasses(),
+				config.changedTests(), config.changedMembers());
 		TestSelector.Selection selection = new TestSelector(config.depMap(), config.state(), config.changedClasses(),
 				config.changedTests(), config.weights(),
 				new TestSelector.Config(config.topN(), config.randomM(), effectiveSeed), config.alwaysRunClasses(),
 				config.changeComplexity(),
-				config.cacheConfig() != null ? config.cacheConfig() : TestSelector.CacheConfig.DISABLED).select();
+				config.cacheConfig() != null ? config.cacheConfig() : TestSelector.CacheConfig.DISABLED, closure)
+				.select();
+		CoverageClosure.Status coverageStatus = selection.coverageStatus();
+		if (closure.memberPrecisionUnavailable()) {
+			config.log().info("[test-order] Coverage closure runs at class-level precision: the dependency index has "
+					+ "no MEMBER instrumentation data. Re-run a learn phase to capture method-level dependencies "
+					+ "for method-level precision.");
+		}
+		// Coverage-closure outcome: WARN on uncovered changed elements; with
+		// coverageEnforce the build fails with an actionable message instead.
+		// Enforce-fails BEFORE the test lists are written so a failed-closure run
+		// never leaves a selected.txt that a subsequent CI step would consume.
+		if (coverageStatus != null && coverageStatus.totalElements() > 0 && !coverageStatus.allCovered()) {
+			List<String> uncovered = coverageStatus.uncoveredElements();
+			String sample = uncovered.stream().limit(3).collect(java.util.stream.Collectors.joining(", "));
+			String fullList = String.join(", ", uncovered);
+			String summaryLine = coverageStatus.coveredCount() + "/" + coverageStatus.totalElements()
+					+ " changed elements are exercised by the selected test subset; " + uncovered.size() + " uncovered";
+			if (config.coverageEnforce()) {
+				throw new IllegalStateException("[test-order] Coverage closure failed: " + summaryLine + ". Uncovered: "
+						+ fullList + ". No selected test exercises these changed elements — the "
+						+ "dependency index may be stale (tests added/changed since the last learn phase). Run a "
+						+ "learn phase to rebuild the index, run the full test suite, or disable enforcement "
+						+ "(-Dtestorder.coverage.enforce=false).");
+			}
+			config.log()
+					.warn("[test-order] Coverage closure: " + summaryLine + " (e.g. " + sample + "). Uncovered: "
+							+ fullList + ". Consider a learn phase ("
+							+ "mvn test -Dtestorder.mode=learn) or running the full suite.");
+		}
 
 		// Warn when changed classes appear in deps of >50% of all tests: the scorer
 		// can't discriminate and the selection is essentially a random subset.
@@ -225,7 +295,8 @@ public final class AffectedOperation {
 					+ selection.remaining().size());
 		}
 
-		SelectionSummary summary = SelectionSummary.from(selection, scoredCount, newCount, alwaysRunCount, fastCount);
-		return new SelectResult(selection, allSelected, summary);
+		SelectionSummary summary = SelectionSummary.from(selection, scoredCount, newCount, alwaysRunCount, fastCount,
+				coverageStatus);
+		return new SelectResult(selection, allSelected, summary, coverageStatus);
 	}
 }

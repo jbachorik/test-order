@@ -39,6 +39,13 @@ public final class AutoWorkflow {
 	private final String requestedMode;
 	private final Runnable ciDownloadCallback;
 	private final Path depsDir;
+	/**
+	 * Whether the caller runs the deferred (remaining) tests as well. When true the
+	 * full suite runs anyway, so the coverage-closure check only reports (never
+	 * fails); when false the closure applies fully, including the coverage-enforce
+	 * fail path.
+	 */
+	private final boolean runRemaining;
 
 	/**
 	 * @param ctx
@@ -54,6 +61,20 @@ public final class AutoWorkflow {
 	 *             if the mode is not one of the valid values
 	 */
 	public AutoWorkflow(PluginContext ctx, String requestedMode, Runnable ciDownloadCallback, Path depsDir) {
+		// Default runRemaining=true: the historical auto semantics run the full
+		// suite (remaining tests included) unless the caller opted out.
+		this(ctx, requestedMode, ciDownloadCallback, depsDir, true);
+	}
+
+	/**
+	 * Full constructor with the run-remaining flag for coverage-closure gating.
+	 *
+	 * @param runRemaining
+	 *            true when the caller also runs the deferred tests (full suite);
+	 *            the closure check then reports but never fails
+	 */
+	public AutoWorkflow(PluginContext ctx, String requestedMode, Runnable ciDownloadCallback, Path depsDir,
+			boolean runRemaining) {
 		this.ctx = ctx;
 		// Validate early by delegating to ModeResolverOperation — single source of
 		// truth
@@ -65,6 +86,7 @@ public final class AutoWorkflow {
 				: requestedMode.trim().toLowerCase(Locale.ROOT);
 		this.ciDownloadCallback = ciDownloadCallback;
 		this.depsDir = depsDir;
+		this.runRemaining = runRemaining;
 	}
 
 	// ═══════════════════════════════════════════════════════════════
@@ -152,7 +174,14 @@ public final class AutoWorkflow {
 		}
 
 		// ── 2. Order + select (single analysis pass) ──────────────────
-		ChangeAnalysis.Result a = ChangeAnalysis.analyze(ctx, ChangeAnalysis.Options.FOR_AUTO);
+		// FOR_AUTO extended with structural analysis (same includeMethodChanges /
+		// includeAllTests / filterToModule as FOR_AUTO, same readOnly=false — the
+		// auto path owns the baseline lifecycle: analyze saves the bytecode-hashes
+		// snapshot and execute() snapshots source/test/method hashes afterwards;
+		// making it read-only would freeze the bytecode baseline and force permanent
+		// re-detection). The structural analysis provides the member-level change
+		// universe the coverage-closure check needs.
+		ChangeAnalysis.Result a = ChangeAnalysis.analyze(ctx, new ChangeAnalysis.Options(true, true, false, true));
 
 		var alwaysRun = AlwaysRunScanner.scanOrEmpty(ctx.testClassesDir());
 
@@ -185,7 +214,19 @@ public final class AutoWorkflow {
 
 		AffectedOperation.SelectResult selectResult;
 		me.bechberger.testorder.TestSelector.CacheConfig cacheConfig = readCacheConfig(ctx.stateFile());
-		if (a.changedClasses().isEmpty() && changedAndNew.isEmpty() && ctx.topN() < 0 && ctx.randomM() == 0
+		if (a.staticAnalysisDegraded()) {
+			// Fail-safe: the changed-element universe is unreliable — run ALL tests of
+			// the module instead of a selected subset (same synthesis as the no-change
+			// topN=-1 path, plus unindexed new/changed tests).
+			Set<String> all = new LinkedHashSet<>(effectiveDepMap.testClasses());
+			all.addAll(changedAndNew);
+			ctx.log()
+					.warn("[test-order] Static analysis degraded — the changed-element universe is unreliable "
+							+ "(class-level fallback). Selecting ALL " + all.size()
+							+ " tests of this module (fail-safe select-all).\nRun: " + ctx.learnCommand());
+			selectResult = AffectedOperation.SelectResult
+					.of(new TestSelector.Selection(new java.util.ArrayList<>(all), java.util.List.of(), 0), true);
+		} else if (a.changedClasses().isEmpty() && changedAndNew.isEmpty() && ctx.topN() < 0 && ctx.randomM() == 0
 				&& !cacheConfig.enabled()) {
 			var allTests = new ArrayList<>(effectiveDepMap.testClasses());
 			selectResult = AffectedOperation.SelectResult
@@ -195,9 +236,16 @@ public final class AutoWorkflow {
 			if (a.changedClasses().isEmpty() && changedAndNew.isEmpty() && (ctx.topN() >= 0 || ctx.randomM() > 0)) {
 				ctx.log().info("[test-order] No changed classes detected — applying topN/randomM selection only.");
 			}
+			// Coverage-closure wiring: the member-level universe (changedMembers) is
+			// threaded into the selector's cover-core phase. When runRemaining=true the
+			// full suite runs anyway, so the closure check must never fail — coverage
+			// counts are still reported (covered X/Y). Enforce applies only when the
+			// deferred tests are NOT run (runRemaining=false).
+			boolean coverageEnforce = ctx.coverageEnforce() && !runRemaining;
 			selectResult = AffectedOperation.select(new AffectedOperation.SelectConfig(effectiveDepMap, a.state(),
 					a.changedClasses(), changedAndNew, a.weights(), ctx.topN(), ctx.randomM(), ctx.seed(), alwaysRun,
-					ctx.selectedFile(), ctx.remainingFile(), ctx.log(), a.changeComplexity(), cacheConfig));
+					ctx.selectedFile(), ctx.remainingFile(), ctx.log(), a.changeComplexity(), cacheConfig,
+					a.changedMembers(), coverageEnforce));
 			// G3: Warn if selection yields no tests in auto mode, but only when the depMap
 			// has tests — modules with no test classes legitimately select nothing.
 			if (selectResult.selection().selected().isEmpty() && !a.depMap().testClasses().isEmpty()
