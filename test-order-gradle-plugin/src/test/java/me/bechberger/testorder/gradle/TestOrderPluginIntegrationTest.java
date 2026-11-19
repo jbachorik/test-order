@@ -576,6 +576,51 @@ class TestOrderPluginIntegrationTest {
     }
 
     @Test
+    @DisplayName("derived tasks mirror the convention task classpath when deps are routed through a custom configuration")
+    void derivedTasksMirrorConventionTestClasspath() throws Exception {
+        scaffoldProject();
+        // Simulate convention plugins (e.g. Datadog ProfilerTestPlugin) that route test
+        // dependencies through their OWN configuration and assign them to their own
+        // Test task in a later afterEvaluate. The raw test source set's runtimeClasspath
+        // then has NO JUnit platform — a derived task wired from the source set fails
+        // with "Failed to load JUnit Platform".
+        writeFile("convention-routed-deps.gradle", """
+                def routedConf = configurations.create('routedTestDeps')
+                routedConf.extendsFrom(configurations.testRuntimeClasspath)
+                routedConf.dependencies.add(project.dependencies.create('org.junit.jupiter:junit-jupiter:5.11.4'))
+                routedConf.dependencies.add(project.dependencies.create('org.junit.platform:junit-platform-launcher:1.11.4'))
+                // JUnit API for test compilation only — at RUNTIME the convention
+                // configuration above is the sole source of the JUnit platform.
+                configurations.testCompileOnly.dependencies.add(
+                        project.dependencies.create('org.junit.jupiter:junit-jupiter:5.11.4'))
+                afterEvaluate {
+                    tasks.named('test') { classpath = sourceSets.main.output + sourceSets.test.output + routedConf }
+                }
+                """);
+        // Override the scaffolded build: NO junit on testImplementation — the convention
+        // configuration is the only source of the JUnit platform. Apply the convention
+        // script AFTER the test-order plugin so its afterEvaluate runs later.
+        String build = Files.readString(projectDir.resolve("build.gradle"));
+        build = build.replace("testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'\n", "");
+        build = build.replace("testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.11.4'\n", "");
+        Files.writeString(projectDir.resolve("build.gradle"),
+                build + "\napply from: 'convention-routed-deps.gradle'\n");
+
+        runner("test", "-Dtestorder.mode=learn").build();
+
+        // Pre-fix the derived task ran with the raw source-set classpath (no JUnit
+        // platform) and failed to even start.
+        BuildResult result = runner("testOrderAffected",
+                "-Dtestorder.changeMode=explicit",
+                "-Dtestorder.changed.classes=com.example.app.Calculator",
+                "-Dtestorder.affected.topN=1",
+                "-Dtestorder.affected.randomM=0").build();
+
+        assertEquals(SUCCESS, result.task(":testOrderAffected").getOutcome(),
+                "derived task must inherit the convention task's classpath (JUnit platform)");
+    }
+
+    @Test
     @DisplayName("testOrderAffected with coverage.enforce fails when no test covers a changed class")
     void affectedTaskEnforceFailsOnUncoveredChangedClass() throws Exception {
         scaffoldProject();

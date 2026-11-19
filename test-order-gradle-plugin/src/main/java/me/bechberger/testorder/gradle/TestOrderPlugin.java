@@ -3935,6 +3935,17 @@ public class TestOrderPlugin implements Plugin<Project> {
         // we wire the source set only after the Java plugin (and thus the "test" source set) exists.
         // If Java is already applied, withType fires immediately (synchronously).
         project.getPlugins().withType(JavaPlugin.class, ignored -> wireDerivedTaskSourceSet(project, task));
+        // Mirror the convention Test task's classpath at derived-task REALIZATION time
+        // (task graph calculation, after every afterEvaluate has run). Convention
+        // plugins may route test dependencies through their own configuration and
+        // assign them only to their own Test tasks in a later afterEvaluate (e.g. the
+        // Datadog ProfilerTestPlugin), leaving the raw test source set's
+        // runtimeClasspath without the JUnit platform — the derived task then fails
+        // with "Failed to load JUnit Platform". Realization time is the first point
+        // where the convention task and its final classpath are both guaranteed
+        // visible. Source-set wiring above stays as the fallback for projects whose
+        // convention task we cannot identify.
+        mirrorConventionTestClasspath(project, task);
         task.useJUnitPlatform();
         task.systemProperty("testorder.state.path",
                 ext.getStateFile().get().getAsFile().getAbsolutePath());
@@ -3957,6 +3968,36 @@ public class TestOrderPlugin implements Plugin<Project> {
         task.setClasspath(testSourceSet.getRuntimeClasspath());
         task.dependsOn(project.getTasks().named("testClasses"));
         task.shouldRunAfter(project.getTasks().named("test"));
+    }
+
+    /**
+     * Copies the classpath of the project's convention Test task (the standard
+     * {@code test} task, or the first user-defined Test task such as Android-style
+     * variant tasks like {@code testDebug}) onto the derived task. Called at derived
+     * task realization time — see the call site comment in
+     * {@link #configureDerivedTestTask} for why earlier points are too early.
+     */
+    private static void mirrorConventionTestClasspath(Project project, Test task) {
+        Test convention = findConventionTestTask(project, task);
+        if (convention != null) {
+            task.setClasspath(convention.getClasspath());
+        }
+    }
+
+    private static Test findConventionTestTask(Project project, Test derived) {
+        Test named = project.getTasks().findByName("test") instanceof Test t ? t : null;
+        if (named != null && named != derived) {
+            return named;
+        }
+        // Android-style convention plugins create variant tasks (testDebug, …) instead
+        // of a single `test` task. Iterating withType(Test) at realization time is safe:
+        // the task graph calculation realizes tasks around this point anyway.
+        for (Test t : project.getTasks().withType(Test.class)) {
+            if (!t.getName().startsWith("testOrder") && t != derived) {
+                return t;
+            }
+        }
+        return null;
     }
 
     private static void ensureJdk17OrHigher(Project project, Test task) {
