@@ -576,14 +576,15 @@ class TestOrderPluginIntegrationTest {
     }
 
     @Test
-    @DisplayName("derived tasks mirror the convention task classpath when deps are routed through a custom configuration")
+    @DisplayName("derived tasks mirror the convention variant task that carries the JUnit platform")
     void derivedTasksMirrorConventionTestClasspath() throws Exception {
         scaffoldProject();
         // Simulate convention plugins (e.g. Datadog ProfilerTestPlugin) that route test
-        // dependencies through their OWN configuration and assign them to their own
-        // Test task in a later afterEvaluate. The raw test source set's runtimeClasspath
-        // then has NO JUnit platform — a derived task wired from the source set fails
-        // with "Failed to load JUnit Platform".
+        // dependencies through their OWN configuration, generate variant Test tasks
+        // (testDebug) carrying it in a later afterEvaluate, and leave the java-plugin
+        // default `test` task UNCONFIGURED — its raw source-set classpath has NO JUnit
+        // platform. A derived task must mirror testDebug, not the bare `test` task
+        // (which would fail with "Failed to load JUnit Platform").
         writeFile("convention-routed-deps.gradle", """
                 def routedConf = configurations.create('routedTestDeps')
                 routedConf.extendsFrom(configurations.testRuntimeClasspath)
@@ -594,22 +595,28 @@ class TestOrderPluginIntegrationTest {
                 configurations.testCompileOnly.dependencies.add(
                         project.dependencies.create('org.junit.jupiter:junit-jupiter:5.11.4'))
                 afterEvaluate {
-                    tasks.named('test') { classpath = sourceSets.main.output + sourceSets.test.output + routedConf }
+                    tasks.register('testDebug', Test) {
+                        classpath = sourceSets.main.output + sourceSets.test.output + routedConf
+                        testClassesDirs = sourceSets.test.output.classesDirs
+                        useJUnitPlatform()
+                    }
                 }
                 """);
         // Override the scaffolded build: NO junit on testImplementation — the convention
-        // configuration is the only source of the JUnit platform. Apply the convention
-        // script AFTER the test-order plugin so its afterEvaluate runs later.
+        // configuration is the only source of the JUnit platform, and the bare `test`
+        // task is deliberately NOT given it (mirrors the java-profiler shape where the
+        // bare `test` classpath resolves with junit=0).
         String build = Files.readString(projectDir.resolve("build.gradle"));
         build = build.replace("testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'\n", "");
         build = build.replace("testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.11.4'\n", "");
         Files.writeString(projectDir.resolve("build.gradle"),
                 build + "\napply from: 'convention-routed-deps.gradle'\n");
 
-        runner("test", "-Dtestorder.mode=learn").build();
+        // Learn on the convention variant task (the bare `test` task cannot even run).
+        runner("testDebug", "-Dtestorder.mode=learn").build();
 
-        // Pre-fix the derived task ran with the raw source-set classpath (no JUnit
-        // platform) and failed to even start.
+        // Pre-fix the derived task mirrored the bare `test` task (junit=0 classpath)
+        // and failed to even start.
         BuildResult result = runner("testOrderAffected",
                 "-Dtestorder.changeMode=explicit",
                 "-Dtestorder.changed.classes=com.example.app.Calculator",
@@ -617,7 +624,7 @@ class TestOrderPluginIntegrationTest {
                 "-Dtestorder.affected.randomM=0").build();
 
         assertEquals(SUCCESS, result.task(":testOrderAffected").getOutcome(),
-                "derived task must inherit the convention task's classpath (JUnit platform)");
+                "derived task must inherit the convention variant task's classpath (JUnit platform)");
     }
 
     @Test

@@ -356,6 +356,18 @@ public class TestOrderPlugin implements Plugin<Project> {
         coreDep.setTransitive(false);
         project.getDependencies().add("testRuntimeOnly", coreDep);
 
+        // Agent jar (OfflineRuntimeBootstrap/UsageStore) — non-transitive. Contributed
+        // at APPLY time, not in offline-learn task wiring: convention plugins that
+        // reassign the Test task classpath wholesale wipe a task-classpath append, and
+        // a dependency added during task wiring would conflict with classpath resolution
+        // performed at derived-task realization ("Cannot mutate the dependencies of
+        // configuration ':testRuntimeOnly' after ... was resolved"). Harmless when the
+        // agent is not used: it only activates via -javaagent or the offline bootstrap.
+        ExternalModuleDependency agentDep = (ExternalModuleDependency) project.getDependencies().create(
+                GROUP_ID + ":test-order-agent:" + VERSION);
+        agentDep.setTransitive(false);
+        project.getDependencies().add("testRuntimeOnly", agentDep);
+
         // TestNG support: add after evaluation so user dependencies are resolved
         if (project.getState().getExecuted()) {
             if (isTestNGOnTestClasspath(project)) {
@@ -1048,22 +1060,6 @@ public class TestOrderPlugin implements Plugin<Project> {
         // stops/merges every IndexCollectorServer in the registry, regardless of which test
         // task triggered it.
         testTask.finalizedBy("testOrderOfflineRestore");
-
-        // Contribute the agent jar as a testRuntimeOnly dependency instead of appending
-        // it to the Test task classpath: convention plugins that reassign the Test task
-        // classpath wholesale (e.g. `test.classpath = customConf`) wipe a task-classpath
-        // append, which left offline learn dying with "OfflineRuntimeBootstrap class not
-        // found". A runtime dependency contributes through testRuntimeClasspath no matter
-        // how the task classpath is reassigned afterwards. testRuntimeOnly is project-wide
-        // (one dependency serves every Test task in the project), so guard against
-        // duplicate declarations across tasks.
-        if (!project.getExtensions().getExtraProperties().has("testorder.offlineRuntimeAdded")) {
-            project.getExtensions().getExtraProperties().set("testorder.offlineRuntimeAdded", Boolean.TRUE);
-            ExternalModuleDependency agentDep = (ExternalModuleDependency) project.getDependencies().create(
-                    GROUP_ID + ":test-order-agent:" + VERSION);
-            agentDep.setTransitive(false);
-            project.getDependencies().add("testRuntimeOnly", agentDep);
-        }
     }
 
     /**
@@ -3971,10 +3967,8 @@ public class TestOrderPlugin implements Plugin<Project> {
     }
 
     /**
-     * Copies the classpath of the project's convention Test task (the standard
-     * {@code test} task, or the first user-defined Test task such as Android-style
-     * variant tasks like {@code testDebug}) onto the derived task. Called at derived
-     * task realization time — see the call site comment in
+     * Copies the classpath of the project's convention Test task onto the derived
+     * task. Called at derived task realization time — see the call site comment in
      * {@link #configureDerivedTestTask} for why earlier points are too early.
      */
     private static void mirrorConventionTestClasspath(Project project, Test task) {
@@ -3985,19 +3979,69 @@ public class TestOrderPlugin implements Plugin<Project> {
     }
 
     private static Test findConventionTestTask(Project project, Test derived) {
-        Test named = project.getTasks().findByName("test") instanceof Test t ? t : null;
-        if (named != null && named != derived) {
-            return named;
-        }
-        // Android-style convention plugins create variant tasks (testDebug, …) instead
-        // of a single `test` task. Iterating withType(Test) at realization time is safe:
-        // the task graph calculation realizes tasks around this point anyway.
-        for (Test t : project.getTasks().withType(Test.class)) {
-            if (!t.getName().startsWith("testOrder") && t != derived) {
-                return t;
+        // Enumerate NAMES first: getNames() does not realize tasks, so we never cascade
+        // into realizing other derived tasks here — their config actions run heavy wiring
+        // (e.g. learn-task agent wiring mutating testRuntimeOnly) that conflicts with the
+        // classpath probing below ("Cannot mutate the dependencies of configuration X
+        // after the configuration's child configuration was resolved").
+        java.util.List<String> names = new java.util.ArrayList<>();
+        for (String name : project.getTasks().getNames()) {
+            if (name.startsWith("testOrder") || name.equals(derived.getName())) {
+                continue;
+            }
+            // Variant Test tasks follow the `test…` naming in the shapes we target
+            // (test, testDebug, testRelease, testUnitTest, …).
+            if (name.startsWith("test")) {
+                names.add(name);
             }
         }
-        return null;
+        if (names.isEmpty()) {
+            return null;
+        }
+        // Bare `test` last: convention plugins (e.g. the Datadog ProfilerTestPlugin)
+        // often leave the java-plugin default `test` task UNCONFIGURED and generate
+        // variant tasks (testDebug, testRelease, …) carrying the real classpath (test
+        // dependencies routed through their own configuration). Mirroring the bare
+        // `test` task would copy a classpath without the JUnit platform and the derived
+        // task would fail with "Failed to load JUnit Platform". Pick the first candidate
+        // whose classpath resolves with junit-platform-launcher (Gradle 9 requires it on
+        // the test runtime classpath to start a JUnit Platform run); when none carries
+        // it, fall back to the bare `test` task if present, else the first candidate —
+        // the run then surfaces the original missing-platform problem.
+        names.sort(java.util.Comparator.comparingInt(n -> n.equals("test") ? 1 : 0));
+        Test bareTest = null;
+        Test firstCandidate = null;
+        for (String name : names) {
+            // Realizes this candidate only — candidates are ordinary user Test tasks.
+            Task t = project.getTasks().findByName(name);
+            if (!(t instanceof Test test) || test == derived) {
+                continue;
+            }
+            if (name.equals("test")) {
+                bareTest = test;
+            }
+            if (firstCandidate == null) {
+                firstCandidate = test;
+            }
+            if (classpathCarriesJUnitPlatformLauncher(test)) {
+                return test;
+            }
+        }
+        return bareTest != null ? bareTest : firstCandidate;
+    }
+
+    private static boolean classpathCarriesJUnitPlatformLauncher(Test task) {
+        try {
+            for (java.io.File f : task.getClasspath()) {
+                if (f.getName().startsWith("junit-platform-launcher")) {
+                    return true;
+                }
+            }
+        } catch (RuntimeException e) {
+            // Candidate classpath not resolvable (missing deps in a variant
+            // configuration, …) — skip this candidate rather than failing from the mirror.
+        }
+        return false;
     }
 
     private static void ensureJdk17OrHigher(Project project, Test task) {
