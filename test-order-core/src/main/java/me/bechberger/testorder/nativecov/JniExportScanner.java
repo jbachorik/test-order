@@ -102,8 +102,17 @@ public final class JniExportScanner {
 			if (root == null || !Files.isDirectory(root)) {
 				continue;
 			}
+			// Walk the real target (Files.walk does not descend into a symlinked
+			// root); keys stay in the DECLARED-root form so they match the gcov
+			// artifacts and change detection.
+			Path walkRoot;
+			try {
+				walkRoot = root.toRealPath();
+			} catch (IOException e) {
+				walkRoot = root.toAbsolutePath().normalize();
+			}
 			List<Path> files;
-			try (Stream<Path> walk = Files.walk(root)) {
+			try (Stream<Path> walk = Files.walk(walkRoot)) {
 				files = walk.filter(Files::isRegularFile).toList();
 			} catch (IOException e) {
 				TestOrderLogger.warn("Failed to scan native root {} for JNI exports: {}", root, e.getMessage());
@@ -111,19 +120,18 @@ public final class JniExportScanner {
 			}
 			for (Path file : files) {
 				String name = file.getFileName().toString();
-				if (!name.endsWith(".cpp") && !name.endsWith(".cc") && !name.endsWith(".c") && !name.endsWith(".cxx")
-						&& !name.endsWith(".h") && !name.endsWith(".hpp") && !name.endsWith(".hh")) {
+				if (!me.bechberger.testorder.changes.NativeChangeDetector.isNativeSourceFile(name)) {
 					continue;
 				}
+				Path declaredFile = root.resolve(walkRoot.relativize(file));
 				try {
 					if (Files.size(file) > MAX_FILE_BYTES) {
 						continue;
 					}
 					Set<String> found = scanFile(Files.readString(file, StandardCharsets.UTF_8));
 					if (!found.isEmpty()) {
-						exports.computeIfAbsent(
-								me.bechberger.testorder.changes.NativeChangeDetector.nativeKey(projectRoot, file),
-								k -> new TreeSet<>()).addAll(found);
+						exports.computeIfAbsent(me.bechberger.testorder.changes.NativeChangeDetector
+								.nativeKey(projectRoot, declaredFile), k -> new TreeSet<>()).addAll(found);
 					}
 				} catch (IOException e) {
 					TestOrderLogger.warn("Failed to read {} for JNI export scan: {}", file, e.getMessage());

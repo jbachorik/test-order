@@ -1,14 +1,17 @@
 package me.bechberger.testorder.changes;
 
+import java.io.BufferedWriter;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 import me.bechberger.testorder.LZ4Support;
+import me.bechberger.testorder.PersistenceSupport;
 import me.bechberger.testorder.TestOrderLogger;
 import net.jpountz.lz4.LZ4FrameInputStream;
 import net.jpountz.lz4.LZ4FrameOutputStream;
@@ -153,8 +156,17 @@ public final class NativeChangeDetector {
 			if (root == null || !Files.isDirectory(root)) {
 				continue;
 			}
+			// Walk the real target: Files.walk does not descend into a symlinked
+			// root. Keys stay in the DECLARED-root form so they match the gcov
+			// artifacts, the JNI scanner, and git-mode detection.
+			Path walkRoot;
+			try {
+				walkRoot = root.toRealPath();
+			} catch (IOException e) {
+				walkRoot = root.toAbsolutePath().normalize();
+			}
 			List<Path> files;
-			try (Stream<Path> walk = Files.walk(root)) {
+			try (Stream<Path> walk = Files.walk(walkRoot)) {
 				files = walk.filter(p -> Files.isRegularFile(p) && isNativeSourceFile(p.getFileName().toString()))
 						.toList();
 			} catch (IOException e) {
@@ -162,7 +174,8 @@ public final class NativeChangeDetector {
 				continue;
 			}
 			for (Path file : files) {
-				hashes.merge(nativeKey(projectRoot, file), FileHashStore.sha256Safe(file), (a, b) -> b);
+				hashes.merge(nativeKey(projectRoot, root.resolve(walkRoot.relativize(file))),
+						FileHashStore.sha256Safe(file), (a, b) -> b);
 			}
 		}
 		return hashes;
@@ -201,17 +214,39 @@ public final class NativeChangeDetector {
 	}
 
 	private static void saveHashes(Map<String, String> hashes, Path hashFile) throws IOException {
+		saveHashes(hashes, hashFile, Files::newOutputStream);
+	}
+
+	@FunctionalInterface
+	interface HashOutputStreamFactory {
+		OutputStream open(Path path) throws IOException;
+	}
+
+	static void saveHashes(Map<String, String> hashes, Path hashFile, HashOutputStreamFactory outputFactory)
+			throws IOException {
 		Path parent = hashFile.getParent();
 		if (parent != null) {
 			Files.createDirectories(parent);
 		}
-		try (LZ4FrameOutputStream lz4os = LZ4Support.frameOutputStreamHC(Files.newOutputStream(hashFile));
-				var pw = new java.io.PrintWriter(new java.io.OutputStreamWriter(lz4os, StandardCharsets.UTF_8))) {
-			hashes.entrySet().stream().sorted(Map.Entry.comparingByKey()).forEach(e -> {
-				pw.print(e.getKey());
-				pw.print('\t');
-				pw.println(e.getValue());
-			});
+		Path temporaryFile = PersistenceSupport.temporarySibling(hashFile);
+		boolean published = false;
+		try {
+			try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(
+					LZ4Support.frameOutputStreamHC(outputFactory.open(temporaryFile)), StandardCharsets.UTF_8))) {
+				for (Map.Entry<String, String> entry : hashes.entrySet().stream().sorted(Map.Entry.comparingByKey())
+						.toList()) {
+					writer.write(entry.getKey());
+					writer.write('\t');
+					writer.write(entry.getValue());
+					writer.write('\n');
+				}
+			}
+			PersistenceSupport.moveIntoPlace(temporaryFile, hashFile);
+			published = true;
+		} finally {
+			if (!published) {
+				Files.deleteIfExists(temporaryFile);
+			}
 		}
 	}
 
@@ -232,9 +267,14 @@ public final class NativeChangeDetector {
 				default -> throw new AssertionError(mode);
 			};
 			for (String file : files) {
-				if (isNativeSourceFile(file)) {
-					changed.add(file);
+				if (!isNativeSourceFile(file) || !file.startsWith(prefix)) {
+					continue;
 				}
+				// Key from the DECLARED root (the same form scanNativeRoots, the JNI
+				// scanner, and gcov artifacts use) — never from the canonical real
+				// path: toGitPrefix canonicalizes symlinked roots, so a real-path key
+				// would diverge from the declared-root keys of every other mode.
+				changed.add(nativeKey(projectRoot, root.resolve(file.substring(prefix.length()))));
 			}
 		}
 		return changed;
@@ -290,12 +330,13 @@ public final class NativeChangeDetector {
 	private static Set<String> filterByPrefix(Collection<String> paths, String prefix) {
 		Set<String> out = new TreeSet<>();
 		for (String p : paths) {
-			String normalized = p.replace('\\', '/');
+			String selected = p;
 			// git status --porcelain may report renames as "old -> new"
-			int arrow = normalized.indexOf(" -> ");
+			int arrow = selected.indexOf(" -> ");
 			if (arrow >= 0) {
-				normalized = normalized.substring(arrow + 4);
+				selected = selected.substring(arrow + 4);
 			}
+			String normalized = RepoChangeListings.unquoteGitPath(selected).replace('\\', '/');
 			if (normalized.startsWith(prefix) && isNativeSourceFile(normalized)) {
 				out.add(normalized);
 			}
@@ -329,32 +370,6 @@ public final class NativeChangeDetector {
 	}
 
 	private static List<String> runGit(Path dir, String... args) throws IOException {
-		String[] cmd = new String[args.length + 1];
-		cmd[0] = "git";
-		System.arraycopy(args, 0, cmd, 1, args.length);
-		ProcessBuilder pb = new ProcessBuilder(cmd);
-		pb.directory(dir.toFile());
-		Process process;
-		try {
-			process = pb.start();
-		} catch (IOException e) {
-			throw new IOException("Failed to run git: " + e.getMessage(), e);
-		}
-		List<String> out;
-		try {
-			out = new ArrayList<>(new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).lines()
-					.filter(s -> !s.isBlank()).toList());
-			if (!process.waitFor(30, TimeUnit.SECONDS)) {
-				process.destroyForcibly();
-				throw new IOException("git " + args[0] + " timed out");
-			}
-		} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-			throw new IOException("git " + args[0] + " interrupted", e);
-		}
-		if (process.exitValue() != 0) {
-			throw new IOException("git " + args[0] + " failed with exit code " + process.exitValue());
-		}
-		return out;
+		return GitSupport.runGit(dir, true, args);
 	}
 }

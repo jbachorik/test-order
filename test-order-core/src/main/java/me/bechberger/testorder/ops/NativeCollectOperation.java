@@ -97,28 +97,11 @@ public final class NativeCollectOperation {
 		if (!exportToFiles.isEmpty()) {
 			DependencyMap index = DependencyMap.load(indexFile);
 			if (index.hasMemberDeps()) {
-				for (String test : index.testClasses()) {
-					Set<String> memberKeys = new TreeSet<>(index.getMemberDeps(test));
-					for (String methodKey : index.methodMemberKeys()) {
-						if (methodClass(methodKey).equals(test)) {
-							memberKeys.addAll(index.getMethodMemberDeps(methodKey));
-						}
-					}
-					Set<String> files = null;
-					for (String memberKey : memberKeys) {
-						Set<String> exported = exportToFiles.get(memberKey);
-						if (exported != null) {
-							if (files == null) {
-								files = new TreeSet<>();
-							}
-							files.addAll(exported);
-						}
-					}
-					if (files != null) {
-						edges.computeIfAbsent(test, k -> new TreeSet<>()).addAll(files);
-						crossCheckTests++;
-						crossCheckEdges += files.size();
-					}
+				Map<String, Set<String>> crossCheck = crossCheckMemberDeps(index, exportToFiles);
+				for (Map.Entry<String, Set<String>> e : crossCheck.entrySet()) {
+					edges.put(e.getKey(), e.getValue());
+					crossCheckTests++;
+					crossCheckEdges += e.getValue().size();
 				}
 			}
 		}
@@ -154,6 +137,38 @@ public final class NativeCollectOperation {
 		}
 		return new Result(parsed.artifactsParsed(), gcovTests, gcovEdges, jniExportCount, crossCheckTests,
 				crossCheckEdges, totalTests, warnings);
+	}
+
+	/**
+	 * Computes the JNI cross-check edges, traversing method-member keys once for
+	 * all test classes.
+	 */
+	static Map<String, Set<String>> crossCheckMemberDeps(DependencyMap index, Map<String, Set<String>> exportToFiles) {
+		Map<String, Set<String>> classToMemberDeps = new HashMap<>();
+		for (String methodKey : index.methodMemberKeys()) {
+			classToMemberDeps.computeIfAbsent(methodClass(methodKey), k -> new TreeSet<>())
+					.addAll(index.getMethodMemberDeps(methodKey));
+		}
+
+		Map<String, Set<String>> edges = new TreeMap<>();
+		for (String test : index.testClasses()) {
+			Set<String> memberKeys = new TreeSet<>(index.getMemberDeps(test));
+			memberKeys.addAll(classToMemberDeps.getOrDefault(test, Set.of()));
+			Set<String> files = null;
+			for (String memberKey : memberKeys) {
+				Set<String> exported = exportToFiles.get(memberKey);
+				if (exported != null) {
+					if (files == null) {
+						files = new TreeSet<>();
+					}
+					files.addAll(exported);
+				}
+			}
+			if (files != null) {
+				edges.put(test, files);
+			}
+		}
+		return edges;
 	}
 
 	/** Class part of a {@code className#methodName} method key. */
