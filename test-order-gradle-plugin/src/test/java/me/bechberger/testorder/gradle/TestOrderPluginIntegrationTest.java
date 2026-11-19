@@ -418,6 +418,59 @@ class TestOrderPluginIntegrationTest {
     }
 
     @Test
+    @DisplayName("learn mode writes the index in the SAME run even when tests fail")
+    void learnWritesIndexDespiteFailingTests() throws Exception {
+        scaffoldProject();
+        // A systematically failing test: the learn run must still aggregate the
+        // collected dependencies into the index (previously the aggregation was a
+        // doLast hook, which Gradle skips when the task fails — the index was only
+        // written by a LATER passing learn run, so ordering never saw the data).
+        writeFile("src/test/java/com/example/app/BrokenTest.java", """
+                package com.example.app;
+                import org.junit.jupiter.api.Test;
+                import static org.junit.jupiter.api.Assertions.*;
+                class BrokenTest {
+                    @Test void alwaysFails() { fail("systematic failure"); }
+                }
+                """);
+
+        BuildResult result = runner("test", "-Dtestorder.mode=learn").buildAndFail();
+
+        assertEquals(FAILED, result.task(":test").getOutcome());
+        assertTrue(Files.exists(projectDir.resolve(".test-order/test-dependencies.lz4")),
+                "The dependency index must be written in the same run even when the learn run fails");
+        String output = result.getOutput();
+        assertTrue(output.contains("merged") || output.contains("Aggregated"),
+                "Aggregation must run despite the failing tests:\n" + output);
+    }
+
+    @Test
+    @DisplayName("order mode after a failed learn run merges pending dependencies in the same build")
+    void orderModeMergesPendingDepsFromFailedLearn() throws Exception {
+        scaffoldProject();
+        writeFile("src/test/java/com/example/app/BrokenTest.java", """
+                package com.example.app;
+                import org.junit.jupiter.api.Test;
+                import static org.junit.jupiter.api.Assertions.*;
+                class BrokenTest {
+                    @Test void alwaysFails() { fail("systematic failure"); }
+                }
+                """);
+        // First run: learn with a failing test. Before the finalizer fix this run
+        // left its collected dependencies unmerged (collector leaked in the daemon,
+        // .deps files pending).
+        runner("test", "-Dtestorder.mode=learn").buildAndFail();
+        // Remove the failing test so the order-mode run itself succeeds.
+        Files.deleteIfExists(projectDir.resolve("src/test/java/com/example/app/BrokenTest.java"));
+
+        BuildResult result = runner("testOrderAffected").build();
+
+        assertEquals(SUCCESS, result.task(":testOrderAffected").getOutcome());
+        assertTrue(Files.exists(projectDir.resolve(".test-order/test-dependencies.lz4")),
+                "The index must exist after the order-mode run (pending .deps merged in the same build)");
+    }
+
+    @Test
     @DisplayName("testOrderAffected with coverage.enforce fails when no test covers a changed class")
     void affectedTaskEnforceFailsOnUncoveredChangedClass() throws Exception {
         scaffoldProject();

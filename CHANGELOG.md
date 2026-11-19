@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Deprecated
 ### Removed
 ### Fixed
+- **Gradle: dependency index now written even when the learn run fails** — index aggregation was a `doLast` hook of the Test task, which Gradle skips when tests fail; the collected dependencies stayed unmerged until a later passing learn run (and were lost entirely if no learn ran again). Aggregation now runs as a project-level finalizer (`testOrderAggregateDeps`) on learn- and order-mode test tasks, so a failing learn run writes the index in the same run and a subsequent order-mode run merges pending dependencies in the same build.
+- **Partially-learned repos no longer bury change-affected tests** — on a non-cold dependency index, tests absent from the index were scored with the full new-test bonus (+15), outranking the change-overlap bonus; an incompletely-learned repo therefore ranked genuinely affected tests last. The new-test bonus now applies only while the index is cold (empty); unindexed tests are still selected and never cache-skipped, but no longer outrank affected tests.
 ### Security
 
 ## [0.1.1] - 2026-10-19

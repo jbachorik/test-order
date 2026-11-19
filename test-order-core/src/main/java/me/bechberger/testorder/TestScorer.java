@@ -540,7 +540,15 @@ public class TestScorer {
 		boolean isNew = !depMap.testClasses().contains(testClassName)
 				&& (topLevel.equals(testClassName) || !depMap.testClasses().contains(topLevel))
 				&& !isKnownContainer(testClassName, depMap) && !isKnownContainer(topLevel, depMap);
-		if (isNew) {
+		// The newTest score bonus applies only on a COLD index (nothing learned yet,
+		// every test is equally unknown). Once ANY index exists, "absent from index"
+		// means "unknown", not "new": on an incompletely-learned repo (e.g. the learn
+		// run itself failed partway), awarding the full newTest bonus to every
+		// unlearned test outranks the change-overlap bonus and buries the genuinely
+		// change-affected test at the back of the queue. The isNew FLAG is unchanged
+		// — unindexed tests are still selected (TestSelector phase 1 / changedAndNew)
+		// and never cache-skipped; they just no longer outrank affected tests.
+		if (isNew && depMap.testClasses().isEmpty()) {
 			score += weights.newTest();
 			LOG.fine(() -> "New test class (not in dependency map): " + testClassName + " — awarded newTest bonus of "
 					+ weights.newTest());
@@ -669,11 +677,14 @@ public class TestScorer {
 		totalScore += failurePts;
 
 		// New test — same logic as score(): inner classes and pure container classes
-		// whose nested classes are known are not considered new.
+		// whose nested classes are known are not considered new. The score bonus is
+		// gated on a cold index — see the comment in score(): once any index exists,
+		// absence from the index means "unknown", not "new", and must not outrank
+		// change-affected tests.
 		boolean isNew = !depMap.testClasses().contains(testClassName)
 				&& (topLevel.equals(testClassName) || !depMap.testClasses().contains(topLevel))
 				&& !isKnownContainer(testClassName, depMap) && !isKnownContainer(topLevel, depMap);
-		int newTestPts = isNew ? weights.newTest() : 0;
+		int newTestPts = isNew && depMap.testClasses().isEmpty() ? weights.newTest() : 0;
 		totalScore += newTestPts;
 
 		// Speed

@@ -885,19 +885,13 @@ public class TestOrderPlugin implements Plugin<Project> {
         testTask.doFirst("snapshotHashes", t -> {
             snapshotHashes(project, ext);
         });
-        testTask.doLast("aggregateDeps", t -> {
-            // Stop IndexCollectorServer if running (agent mode)
-            CollectorEntry entry = COLLECTOR_REGISTRY.remove(testTask.getPath());
-            if (entry != null) {
-                final CollectorEntry e = entry;
-                int merged = withScopedCompression(e.compression(), () -> e.collector().stopAndMerge());
-                if (merged > 0) {
-                    project.getLogger().lifecycle("[test-order] IndexCollectorServer merged {} test classes via socket",
-                            merged);
-                }
-            }
-            aggregateDependencyFiles(project, ext, false);
-        });
+        // Index aggregation runs as a project-level FINALIZER, not a doLast hook:
+        // Gradle skips a failed task's remaining actions, so a doLast aggregation
+        // would never run when tests fail — leaving the collector unmerged and the
+        // index unwritten exactly when ordering matters most (failing runs).
+        // finalizedBy runs even on failure (same guarantee testOrderOfflineRestore
+        // relies on); when tests succeed it performs the same merge the doLast did.
+        testTask.finalizedBy("testOrderAggregateDeps");
     }
 
     /**
@@ -1331,6 +1325,13 @@ public class TestOrderPlugin implements Plugin<Project> {
                 ((Test) t).systemProperty(entry.getKey(), entry.getValue());
             }
         });
+
+        // Finalize order-mode test tasks with the aggregation task as well: it merges
+        // pending .deps/fallback payloads left by a previously FAILED learn run (whose
+        // doLast-time aggregation never ran) in the SAME build, and is a cheap no-op
+        // when nothing is pending. Without this, an order-mode run after a failed
+        // learn scores against the stale pre-learn index.
+        testTask.finalizedBy("testOrderAggregateDeps");
     }
 
     // -----------------------------------------------------------------------
@@ -1369,38 +1370,26 @@ public class TestOrderPlugin implements Plugin<Project> {
                 }
                 // Drain every collector for this project so socket-based deps are merged
                 // regardless of which test task triggered the finalizer.
-                // Root-project tasks have the form ":taskName" (a single leading colon,
-                // no further colons). Subproject tasks have the form ":sub:taskName".
-                // Using childPrefix ":" for the root would match *everything*, so we
-                // special-case root: keep only paths that contain no second colon.
-                String projectPath = project.getPath();
-                final boolean isRoot = projectPath.equals(":");
-                String childPrefix = isRoot ? null : projectPath + ":";
-                java.util.Iterator<java.util.Map.Entry<String, CollectorEntry>> it =
-                        COLLECTOR_REGISTRY.entrySet().iterator();
-                while (it.hasNext()) {
-                    java.util.Map.Entry<String, CollectorEntry> entry = it.next();
-                    String taskPath = entry.getKey();
-                    boolean belongs;
-                    if (isRoot) {
-                        // Root-project task paths: ":taskName" — exactly one colon (at index 0)
-                        belongs = taskPath.startsWith(":") && taskPath.indexOf(':', 1) < 0;
-                    } else {
-                        belongs = taskPath.startsWith(childPrefix) || taskPath.equals(projectPath);
-                    }
-                    if (!belongs) {
-                        continue;
-                    }
-                    CollectorEntry ce = entry.getValue();
-                    it.remove();
-                    final CollectorEntry c = ce;
-                    int merged = withScopedCompression(c.compression(), () -> c.collector().stopAndMerge());
-                    if (merged > 0) {
-                        project.getLogger().lifecycle(
-                                "[test-order] IndexCollectorServer merged {} test classes via socket (task {})",
-                                merged, taskPath);
-                    }
-                }
+                drainProjectCollectors(project);
+            });
+        });
+
+        // Project-level aggregation finalizer for learn AND order mode test tasks.
+        // Gradle skips a failed task's remaining actions, so a doLast aggregation
+        // hook never runs when tests fail — which is exactly when ordering matters
+        // most. As a finalizedBy task this runs even when the test task fails: the
+        // collector is stopped and stopAndMerge writes the index in the SAME run,
+        // and pending .deps/fallback payloads from a previously failed learn run are
+        // merged by the next order-mode run instead of sitting stale in the daemon.
+        // When no collector is registered and no pending payloads exist, this is a
+        // cheap no-op.
+        project.getTasks().register("testOrderAggregateDeps", task -> {
+            task.setGroup("test-order");
+            task.setDescription(
+                    "Merge collected dependencies into the index (project-level finalizer for test tasks; runs even when tests fail)");
+            task.doLast("testOrderAggregateDeps", t -> {
+                drainProjectCollectors(project);
+                aggregateDependencyFiles(project, ext, false);
             });
         });
 
@@ -4443,6 +4432,43 @@ public class TestOrderPlugin implements Plugin<Project> {
     }
 
     /** Atomically prune-if-needed then register a collector. */
+    /**
+     * Drains every collector registered for the given project: stops the server and
+     * merges its recorded dependencies into the index. Root-project task paths have
+     * the form ":taskName" (a single leading colon, no further colons); subproject
+     * task paths have the form ":sub:taskName". The root case is special-cased
+     * because a childPrefix of ":" would match every path.
+     */
+    private static void drainProjectCollectors(Project project) {
+        String projectPath = project.getPath();
+        final boolean isRoot = projectPath.equals(":");
+        String childPrefix = isRoot ? null : projectPath + ":";
+        java.util.Iterator<java.util.Map.Entry<String, CollectorEntry>> it =
+                COLLECTOR_REGISTRY.entrySet().iterator();
+        while (it.hasNext()) {
+            java.util.Map.Entry<String, CollectorEntry> entry = it.next();
+            String taskPath = entry.getKey();
+            boolean belongs;
+            if (isRoot) {
+                belongs = taskPath.startsWith(":") && taskPath.indexOf(':', 1) < 0;
+            } else {
+                belongs = taskPath.startsWith(childPrefix) || taskPath.equals(projectPath);
+            }
+            if (!belongs) {
+                continue;
+            }
+            CollectorEntry ce = entry.getValue();
+            it.remove();
+            final CollectorEntry c = ce;
+            int merged = withScopedCompression(c.compression(), () -> c.collector().stopAndMerge());
+            if (merged > 0) {
+                project.getLogger().lifecycle(
+                        "[test-order] IndexCollectorServer merged {} test classes via socket (task {})",
+                        merged, taskPath);
+            }
+        }
+    }
+
     private static synchronized void registerCollector(String taskPath, CollectorEntry entry) {
         if (COLLECTOR_REGISTRY.size() >= MAX_COLLECTOR_ENTRIES) {
             pruneCollectorRegistry();
