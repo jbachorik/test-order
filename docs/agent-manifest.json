@@ -491,6 +491,19 @@
       "exampleGradle": "./gradlew testOrderCoverage"
     },
     {
+      "name": "native-collect",
+      "maven": null,
+      "gradle": "testOrderNativeCollect",
+      "description": "Merge per-test native coverage artifacts and JNI cross-check edges (test → native source file) into the dependency index. Requires testOrder { nativeTests { ... } } configuration and an existing index. Gradle only.",
+      "stability": "experimental",
+      "supportsJson": false,
+      "jsonProperty": null,
+      "outputsTo": "log",
+      "requiresIndex": true,
+      "exampleMaven": null,
+      "exampleGradle": "./gradlew testOrderNativeCollect"
+    },
+    {
       "name": "offline-restore",
       "maven": null,
       "gradle": "testOrderOfflineRestore",
