@@ -193,7 +193,11 @@ public class ChangeDetector {
 	 */
 	private static final ConcurrentHashMap<Path, Path> gitRootCache = new ConcurrentHashMap<>();
 
-	private static Path findGitRoot(Path projectRoot) {
+	/**
+	 * Package-visible so {@link NativeChangeDetector} reuses the same git-root
+	 * resolution.
+	 */
+	static Path findGitRoot(Path projectRoot) {
 		Path normalized = projectRoot.toAbsolutePath().normalize();
 		return gitRootCache.computeIfAbsent(normalized, ChangeDetector::resolveGitRoot);
 	}

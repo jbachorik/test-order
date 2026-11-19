@@ -67,6 +67,8 @@ public final class PluginContext {
 	private final Path testHashFile;
 	private final Path methodHashFile;
 	private final Path bytecodeHashFile;
+	private final Path nativeHashFile;
+	private final List<Path> nativeRoots;
 
 	// ── Change detection config ──────────────────────────────────────
 	private final String changeMode;
@@ -145,6 +147,8 @@ public final class PluginContext {
 		this.testHashFile = b.testHashFile;
 		this.methodHashFile = b.methodHashFile;
 		this.bytecodeHashFile = b.bytecodeHashFile;
+		this.nativeHashFile = b.nativeHashFile;
+		this.nativeRoots = b.nativeRoots != null ? List.copyOf(b.nativeRoots) : List.of();
 		this.changeMode = b.changeMode;
 		this.changedClasses = b.changedClasses;
 		this.changedTestClasses = b.changedTestClasses;
@@ -229,6 +233,18 @@ public final class PluginContext {
 	public Path bytecodeHashFile() {
 		return bytecodeHashFile;
 	}
+
+	public Path nativeHashFile() {
+		return nativeHashFile;
+	}
+
+	/**
+	 * Declared native source roots (empty when native tests are not configured).
+	 */
+	public List<Path> nativeRoots() {
+		return nativeRoots;
+	}
+
 	public String changeMode() {
 		return changeMode;
 	}
@@ -385,6 +401,8 @@ public final class PluginContext {
 		private Path testHashFile;
 		private Path methodHashFile;
 		private Path bytecodeHashFile;
+		private Path nativeHashFile;
+		private List<Path> nativeRoots;
 		private String changeMode;
 		private String changedClasses;
 		private String changedTestClasses;
@@ -482,6 +500,16 @@ public final class PluginContext {
 		}
 		public Builder bytecodeHashFile(Path v) {
 			this.bytecodeHashFile = v;
+			return this;
+		}
+
+		public Builder nativeHashFile(Path v) {
+			this.nativeHashFile = v;
+			return this;
+		}
+
+		public Builder nativeRoots(List<Path> v) {
+			this.nativeRoots = v;
 			return this;
 		}
 		public Builder changeMode(String v) {

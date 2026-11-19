@@ -619,7 +619,7 @@ class DependencyMapTest {
 	@Test
 	void formatVersionIsAccessible() {
 		// Verify the FORMAT_VERSION constant is exposed for ExportJsonOperation
-		assertEquals(1, DependencyMap.FORMAT_VERSION);
+		assertEquals(2, DependencyMap.FORMAT_VERSION);
 	}
 
 	@Test

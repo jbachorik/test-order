@@ -53,7 +53,11 @@ public class FileHashStore {
 		return new FileHashStore(hashes);
 	}
 
-	private static String sha256Safe(Path file) {
+	/**
+	 * Package-visible so {@link NativeChangeDetector} hashes native files
+	 * identically.
+	 */
+	static String sha256Safe(Path file) {
 		try {
 			return sha256(file);
 		} catch (IOException e) {
@@ -133,7 +137,11 @@ public class FileHashStore {
 		}
 	});
 
-	private static String sha256(Path file) throws IOException {
+	/**
+	 * Package-visible so {@link NativeChangeDetector} hashes native files
+	 * identically.
+	 */
+	static String sha256(Path file) throws IOException {
 		// Normalize source content so that comment-only and whitespace-only changes
 		// do not produce different hashes. String literal changes are still detected.
 		String source = Files.readString(file, StandardCharsets.UTF_8);

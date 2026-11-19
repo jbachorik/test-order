@@ -10,6 +10,7 @@ import me.bechberger.testorder.TestOrderState;
 import me.bechberger.testorder.TestScorer;
 import me.bechberger.testorder.changes.BytecodeDependencyAugmenter;
 import me.bechberger.testorder.changes.BytecodeHashStore;
+import me.bechberger.testorder.changes.ChangeDetectionSupport;
 import me.bechberger.testorder.changes.StaticCallGraphAnalyzer;
 import me.bechberger.testorder.changes.StructuralChangeAnalyzer;
 import me.bechberger.testorder.changes.StructuralChangeAnalyzer.ChangedMembers;
@@ -324,6 +325,35 @@ public final class ChangeAnalysis {
 									+ (mergedChanged.size() - changed.size()) + " class(es) from "
 									+ siblingFutures.size() + " sibling source root(s).");
 					changed = mergedChanged;
+				}
+			}
+		}
+
+		// ── Native change detection ─────────────────────────────────
+		// When the consumer declares testOrder { nativeTests { sourceRoots } },
+		// changed .cpp/.h files join the changed-unit universe as path-keyed deps so
+		// both native-edge tests (gcov/JNI cross-check) and Java tests get scored.
+		// Explicit changed-class lists stay authoritative (same BUG-165 contract as
+		// the bytecode detection below) — native detection is skipped when one is set.
+		if (!ctx.nativeRoots().isEmpty() && ctx.nativeHashFile() != null) {
+			boolean explicitChangedClassesSet = ctx.changedClasses() != null && !ctx.changedClasses().isBlank();
+			if (!explicitChangedClassesSet && !"explicit".equalsIgnoreCase(ctx.changeMode())) {
+				final Set<String> nativeChanged = new java.util.LinkedHashSet<>();
+				try {
+					var mode = ChangeDetectionSupport.resolveMode(ctx.changeMode(), ctx.nativeHashFile());
+					nativeChanged
+							.addAll(me.bechberger.testorder.changes.NativeChangeDetector.detect(mode, ctx.projectRoot(),
+									ctx.nativeRoots(), ctx.nativeHashFile(), null, true, sharedRepoSnapshot));
+				} catch (IOException e) {
+					ctx.log().warn("[test-order] Native change detection failed: " + e.getMessage()
+							+ " — falling back to no native changes");
+				}
+				if (!nativeChanged.isEmpty()) {
+					Set<String> mergedChanged = new java.util.LinkedHashSet<>(changed);
+					mergedChanged.addAll(nativeChanged);
+					changed = mergedChanged;
+					ctx.log().debug("[test-order] native change detection added " + nativeChanged.size()
+							+ " native file(s) to the changed-unit set");
 				}
 			}
 		}

@@ -17,12 +17,19 @@ import net.jpountz.lz4.LZ4FrameOutputStream;
 /**
  * Maps test class FQCNs to the set of application class FQCNs they depend on.
  * <p>
- * The on-disk format is a section-based binary format (version 1) inside an
+ * The on-disk format is a section-based binary format (version 2) inside an
  * LZ4-compressed stream. The header is {@code TORD} (4 bytes) followed by a
  * format version (2-byte big-endian short). Each payload section has a type
  * tag, length prefix, and payload — unknown section types are skipped on read,
- * enabling forward-compatible extensibility. {@link #save(Path)} writes v1.
- * {@link #load(Path)} reads v1.
+ * enabling forward-compatible extensibility. {@link #save(Path)} writes v2.
+ * {@link #load(Path)} reads v1 and v2.
+ *
+ * <p>
+ * Version 2 differs from version 1 only in the <b>dependency-name
+ * namespace</b>: dependency units may be native source-file paths (e.g.
+ * {@code src/profiling/foo.cpp}, always containing {@code /}) alongside Java
+ * FQCNs. Version 1 readers reject v2 files; version 2 readers accept v1 files
+ * (v1 never contains path-keyed deps) and upgrade in place on the next save.
  *
  * <p>
  * Thread-safety: instance state is <b>not</b> thread-safe — concurrent mutation
@@ -41,8 +48,17 @@ public class DependencyMap {
 	/** Magic marker inside the LZ4 payload: ASCII "TORD". */
 	private static final byte[] FORMAT_MAGIC = {'T', 'O', 'R', 'D'};
 
-	/** Current binary format version. */
-	public static final short FORMAT_VERSION = 1;
+	/**
+	 * Current binary format version.
+	 * <p>
+	 * Version 2 allows native source-file paths as dependency units (see class
+	 * javadoc). Bumping to 2 makes older readers fail loudly instead of silently
+	 * dropping native edges when they rewrite the shared index.
+	 */
+	public static final short FORMAT_VERSION = 2;
+
+	/** Oldest binary format version this reader accepts. */
+	public static final short MIN_SUPPORTED_VERSION = 1;
 
 	// ── H12: per-JVM load cache keyed by (absolutePath, mtime, size) ─────────
 	// Avoids re-deserializing the same index file N times in a Maven reactor or
@@ -329,6 +345,15 @@ public class DependencyMap {
 	/** Returns all method keys (className#methodName) that have dependency data. */
 	public Set<String> methodKeys() {
 		return Collections.unmodifiableSet(methodDependencies.keySet());
+	}
+
+	/**
+	 * Returns all method keys (className#methodName) that have member-level
+	 * dependency data. Distinct from {@link #methodKeys()}, which covers
+	 * class-level method dependencies.
+	 */
+	public Set<String> methodMemberKeys() {
+		return Collections.unmodifiableSet(methodMemberDepsMap.keySet());
 	}
 
 	/** Whether this map has any per-method dependency data. */
@@ -1430,9 +1455,10 @@ public class DependencyMap {
 				throw new IOException("Unsupported index format (expected TORD magic) in " + indexFile);
 			}
 			short version = in.readShort();
-			if (version != FORMAT_VERSION) {
+			if (version < MIN_SUPPORTED_VERSION || version > FORMAT_VERSION) {
 				throw new IOException("Unsupported dependency index format version " + version + " (expected "
-						+ FORMAT_VERSION + ") in " + indexFile + ". Please rebuild the dependency index.");
+						+ MIN_SUPPORTED_VERSION + "–" + FORMAT_VERSION + ") in " + indexFile
+						+ ". Please rebuild the dependency index.");
 			}
 
 			// ── Read section count and iterate ───────────────────────

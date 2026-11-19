@@ -3,6 +3,8 @@ package me.bechberger.testorder.ops;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Map;
+import java.util.Set;
 
 import me.bechberger.testorder.DependencyMap;
 import me.bechberger.testorder.PersistenceSupport;
@@ -73,6 +75,35 @@ public final class IndexCompactionOperation {
 		if (afterClasses == 0) {
 			log.warn("No test classes found in .deps files");
 			return new CompactionResult(beforeClasses, afterClasses, 0, "No test classes to index");
+		}
+
+		// Native edges (v2 path-keyed deps) live only in the binary index — the .deps
+		// files never carry them. Carry them over from the existing index so compaction
+		// does not silently drop the native test→file edges until the next collect run.
+		if (Files.exists(outputFile)) {
+			try {
+				DependencyMap previous = DependencyMap.load(outputFile);
+				Map<String, Set<String>> nativeDeps = new java.util.LinkedHashMap<>();
+				int nativeEdgeCount = 0;
+				for (String test : previous.testClasses()) {
+					Set<String> paths = new java.util.TreeSet<>();
+					for (String dep : previous.get(test)) {
+						if (dep.indexOf('/') >= 0) {
+							paths.add(dep);
+						}
+					}
+					if (!paths.isEmpty()) {
+						nativeDeps.put(test, paths);
+						nativeEdgeCount += paths.size();
+					}
+				}
+				if (!nativeDeps.isEmpty()) {
+					mergedMap = mergedMap.withAugmentation(nativeDeps);
+					log.info("Preserved " + nativeEdgeCount + " native edge(s) from the previous index");
+				}
+			} catch (IOException e) {
+				log.warn("Could not preserve native edges from the existing index: " + e.getMessage());
+			}
 		}
 
 		// Write new index
