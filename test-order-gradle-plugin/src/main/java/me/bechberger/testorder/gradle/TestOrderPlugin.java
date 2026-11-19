@@ -3973,61 +3973,81 @@ public class TestOrderPlugin implements Plugin<Project> {
      */
     private static void mirrorConventionTestClasspath(Project project, Test task) {
         Test convention = findConventionTestTask(project, task);
-        if (convention != null) {
-            task.setClasspath(convention.getClasspath());
+        if (convention == null) {
+            return;
         }
+        task.setClasspath(convention.getClasspath());
+        // Mirror the classpath's build dependencies too: a FileCollection copy carries
+        // the files but not the task wiring that rebuilds pinned artifacts. A convention
+        // plugin may pin a library JAR file on the convention task's classpath and rely
+        // on its own dependsOn(configuration) to rebuild it — without this, the derived
+        // task can execute against a STALE JAR from before the source change it is
+        // supposed to test (observed: the affected-test run loaded a pre-change JAR and
+        // passed a test that fails against the recompiled sources).
+        task.dependsOn(convention.getClasspath().getBuildDependencies());
     }
 
     private static Test findConventionTestTask(Project project, Test derived) {
         // Enumerate NAMES first: getNames() does not realize tasks, so we never cascade
         // into realizing other derived tasks here — their config actions run heavy wiring
-        // (e.g. learn-task agent wiring mutating testRuntimeOnly) that conflicts with the
-        // classpath probing below ("Cannot mutate the dependencies of configuration X
-        // after the configuration's child configuration was resolved").
-        java.util.List<String> names = new java.util.ArrayList<>();
+        // that conflicts with the classpath probing below once a configuration has been
+        // resolved ("Cannot mutate the dependencies of configuration X after the
+        // configuration's child configuration was resolved").
+        java.util.List<String> variantNames = new java.util.ArrayList<>();
+        String bareTestName = null;
         for (String name : project.getTasks().getNames()) {
             if (name.startsWith("testOrder") || name.equals(derived.getName())) {
                 continue;
             }
             // Variant Test tasks follow the `test…` naming in the shapes we target
             // (test, testDebug, testRelease, testUnitTest, …).
-            if (name.startsWith("test")) {
-                names.add(name);
+            if (name.equals("test")) {
+                bareTestName = name;
+            } else if (name.startsWith("test")) {
+                variantNames.add(name);
             }
         }
-        if (names.isEmpty()) {
-            return null;
-        }
-        // Bare `test` last: convention plugins (e.g. the Datadog ProfilerTestPlugin)
-        // often leave the java-plugin default `test` task UNCONFIGURED and generate
-        // variant tasks (testDebug, testRelease, …) carrying the real classpath (test
-        // dependencies routed through their own configuration). Mirroring the bare
-        // `test` task would copy a classpath without the JUnit platform and the derived
-        // task would fail with "Failed to load JUnit Platform". Pick the first candidate
-        // whose classpath resolves with junit-platform-launcher (Gradle 9 requires it on
-        // the test runtime classpath to start a JUnit Platform run); when none carries
-        // it, fall back to the bare `test` task if present, else the first candidate —
-        // the run then surfaces the original missing-platform problem.
-        names.sort(java.util.Comparator.comparingInt(n -> n.equals("test") ? 1 : 0));
+        // Probe order — convention plugins shape the candidate pool in two ways, and
+        // mirroring the wrong one reproduces the original "Failed to load JUnit
+        // Platform" failure:
+        // (1) the bare `test` task is the correctly configured convention task in most
+        //     projects — prefer it WHEN its classpath actually carries the JUnit platform
+        //     launcher (Gradle 9 requires it on the test runtime classpath to start a
+        //     JUnit Platform run);
+        // (2) some convention plugins (e.g. the Datadog ProfilerTestPlugin) leave the
+        //     java-plugin default `test` task UNCONFIGURED and generate variant tasks
+        //     (testDebug, …) carrying the real classpath (test dependencies routed
+        //     through their own configuration) — then the first launcher-carrying
+        //     variant wins;
+        // (3) when no candidate carries the launcher, fall back to the bare `test` task
+        //     if present, else the first variant — the run then surfaces the original
+        //     missing-platform problem.
+        java.util.Collections.sort(variantNames);
         Test bareTest = null;
-        Test firstCandidate = null;
-        for (String name : names) {
+        Test firstVariant = null;
+        if (bareTestName != null) {
+            Task t = project.getTasks().findByName(bareTestName);
+            if (t instanceof Test test && test != derived) {
+                bareTest = test;
+                if (classpathCarriesJUnitPlatformLauncher(test)) {
+                    return test;
+                }
+            }
+        }
+        for (String name : variantNames) {
             // Realizes this candidate only — candidates are ordinary user Test tasks.
             Task t = project.getTasks().findByName(name);
             if (!(t instanceof Test test) || test == derived) {
                 continue;
             }
-            if (name.equals("test")) {
-                bareTest = test;
-            }
-            if (firstCandidate == null) {
-                firstCandidate = test;
+            if (firstVariant == null) {
+                firstVariant = test;
             }
             if (classpathCarriesJUnitPlatformLauncher(test)) {
                 return test;
             }
         }
-        return bareTest != null ? bareTest : firstCandidate;
+        return bareTest != null ? bareTest : firstVariant;
     }
 
     private static boolean classpathCarriesJUnitPlatformLauncher(Test task) {
