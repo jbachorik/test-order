@@ -2642,6 +2642,13 @@ public class TestOrderPlugin implements Plugin<Project> {
             });
         });
 
+        project.getTasks().register("testOrderNativeCollect", task -> {
+            task.setGroup("test-order");
+            task.setDescription("Merge per-test native coverage artifacts and JNI cross-check edges "
+                    + "into the dependency index (requires testOrder { nativeTests { ... } })");
+            task.doLast(t -> runNativeCollect(project, ext));
+        });
+
         project.getTasks().register("testOrderSnapshot", task -> {
             task.setGroup("test-order");
             task.setDescription("Save hash snapshots of source and test files for since-last-run change detection");
@@ -2999,6 +3006,8 @@ public class TestOrderPlugin implements Plugin<Project> {
                 .testHashFile(ext.getTestHashFile().get().getAsFile().toPath())
                 .methodHashFile(ext.getMethodHashFile().get().getAsFile().toPath())
                 .bytecodeHashFile(ext.getBytecodeHashFile().get().getAsFile().toPath())
+                .nativeHashFile(ext.getNativeHashFile().get().getAsFile().toPath())
+                .nativeRoots(resolveNativeRoots(project, ext))
                 .bytecodeChangeDetectionEnabled(ext.getBytecodeChangeDetectionEnabled().get())
                 .bytecodeAugmentDependencyMapEnabled(ext.getBytecodeAugmentDependencyMapEnabled().get())
                 .changeMode(resolveChangeMode(project, ext))
@@ -3386,6 +3395,77 @@ public class TestOrderPlugin implements Plugin<Project> {
                     resolveTestSourceRoot(project),
                     ext.getMethodHashFile().get().getAsFile().toPath(),
                     wrapLog(project));
+        }
+        List<Path> nativeRoots = resolveNativeRoots(project, ext);
+        if (!nativeRoots.isEmpty()) {
+            try {
+                me.bechberger.testorder.changes.NativeChangeDetector.snapshot(
+                        project.getRootProject().getProjectDir().toPath().toAbsolutePath(),
+                        nativeRoots,
+                        ext.getNativeHashFile().get().getAsFile().toPath());
+            } catch (IOException e) {
+                project.getLogger().warn("[test-order] Failed to save native hash snapshot: {}", e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Declared native source roots, resolved against the project directory.
+     * Empty when {@code nativeTests} is absent or has no sourceRoots — native
+     * support is active only when configured.
+     */
+    static List<Path> resolveNativeRoots(Project project, TestOrderExtension ext) {
+        TestOrderExtension.NativeTests nt = ext.getNativeTests();
+        if (nt == null) {
+            return List.of();
+        }
+        List<Path> roots = new ArrayList<>();
+        for (File f : nt.getSourceRoots()) {
+            Path p = f.toPath();
+            if (!p.isAbsolute()) {
+                p = project.getProjectDir().toPath().resolve(p);
+            }
+            roots.add(p.toAbsolutePath().normalize());
+        }
+        return roots;
+    }
+
+    /** Coverage directory declared for native collect, or null when not set. */
+    static Path resolveNativeCoverageDir(TestOrderExtension ext) {
+        TestOrderExtension.NativeTests nt = ext.getNativeTests();
+        if (nt == null) {
+            return null;
+        }
+        java.io.File dir = nt.getCoverageDir().getAsFile().getOrNull();
+        return dir != null ? dir.toPath() : null;
+    }
+
+    private static void runNativeCollect(Project project, TestOrderExtension ext) {
+        List<Path> nativeRoots = resolveNativeRoots(project, ext);
+        if (nativeRoots.isEmpty()) {
+            throw new GradleException("[test-order] testOrderNativeCollect requires native source roots:\n"
+                    + "testOrder { nativeTests { sourceRoots = files(\"src/<native-dir>\") } }");
+        }
+        Path coverageDir = resolveNativeCoverageDir(ext);
+        if (coverageDir == null) {
+            project.getLogger().warn("[test-order] nativeTests.coverageDir is not set — skipping coverage "
+                    + "artifact parsing, performing only the JNI cross-check");
+        } else if (!Files.isDirectory(coverageDir)) {
+            project.getLogger().warn("[test-order] nativeTests.coverageDir {} does not exist — skipping "
+                    + "coverage artifact parsing, performing only the JNI cross-check", coverageDir);
+        }
+        Path projectRoot = project.getRootProject().getProjectDir().toPath().toAbsolutePath();
+        Path indexFile = ext.getIndexFile().get().getAsFile().toPath();
+        try {
+            me.bechberger.testorder.ops.NativeCollectOperation.Result result =
+                    me.bechberger.testorder.ops.NativeCollectOperation.collect(
+                            projectRoot, nativeRoots, coverageDir, indexFile, wrapLog(project));
+            project.getLogger().lifecycle("[test-order] Native collect: {} artifact(s) parsed, "
+                            + "{} test(s) with gcov edges, {} JNI export(s), cross-check: {} edge(s) for {} test(s)",
+                    result.artifactsParsed(), result.testsWithGcovEdges(), result.jniExportCount(),
+                    result.crossCheckEdgeCount(), result.crossCheckTests());
+        } catch (IOException e) {
+            throw new GradleException("[test-order] Native collect failed: " + e.getMessage(), e);
         }
     }
 

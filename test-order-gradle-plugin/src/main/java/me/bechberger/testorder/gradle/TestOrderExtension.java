@@ -1,10 +1,13 @@
 package me.bechberger.testorder.gradle;
 
 import org.gradle.api.Project;
+import org.gradle.api.Action;
+import org.gradle.api.file.ConfigurableFileCollection;
 import org.gradle.api.file.DirectoryProperty;
 import org.gradle.api.file.RegularFileProperty;
 import org.gradle.api.invocation.Gradle;
 import org.gradle.api.provider.Property;
+import org.gradle.api.tasks.Nested;
 
 /**
  * Extension DSL for the test-order Gradle plugin.
@@ -71,6 +74,9 @@ public abstract class TestOrderExtension {
 
     /** Per-method hash file. */
     public abstract RegularFileProperty getMethodHashFile();
+
+    /** Per-file hash file for declared native source roots (native change detection). */
+    public abstract RegularFileProperty getNativeHashFile();
 
     /** Compiled-bytecode hash file (per-class + per-method bytecode SHA-256). */
     public abstract RegularFileProperty getBytecodeHashFile();
@@ -282,6 +288,45 @@ public abstract class TestOrderExtension {
      */
     public abstract Property<Boolean> getAutoRunRemaining();
 
+    // ---- Native (C/C++) tests ----
+
+    /**
+     * Native test configuration. Declaring this block enables native support:
+     * hashing of the declared native source roots for change detection, the
+     * {@code testOrderNativeCollect} task, and Java↔native cross-check scoring.
+     * <pre>
+     * testOrder {
+     *     nativeTests {
+     *         sourceRoots = files("src/profiling")   // C/C++ sources, tracked for changes
+     *         coverageDir = layout.buildDirectory.dir("native-coverage") // per-test gcov artifacts
+     *         binaries = files("build/lib")          // optional; reserved for future use
+     *     }
+     * }
+     * </pre>
+     */
+    @Nested
+    public abstract NativeTests getNativeTests();
+
+    /** Configure the native test block (Gradle DSL: {@code nativeTests { ... }}). */
+    public void nativeTests(Action<? super NativeTests> action) {
+        action.execute(getNativeTests());
+    }
+
+    /** Native test configuration (see {@link #getNativeTests()}). */
+    public abstract static class NativeTests {
+        /** Native source roots (C/C++ source directories) tracked for change detection. */
+        public abstract ConfigurableFileCollection getSourceRoots();
+
+        /** Directory containing per-test native coverage artifacts consumed by {@code testOrderNativeCollect}. */
+        public abstract DirectoryProperty getCoverageDir();
+
+        /**
+         * Optional native binaries or build-output directories. Not required for
+         * coverage parsing; reserved for future symbol resolution use.
+         */
+        public abstract ConfigurableFileCollection getBinaries();
+    }
+
     // ---- Dump ----
 
     /** Output file for the dump task. If empty, writes to stdout. */
@@ -397,6 +442,11 @@ public abstract class TestOrderExtension {
         getCoverageThreshold().convention(2);
         getCoverageOutputDir().convention(project.getLayout().getBuildDirectory().dir("coverage-reports"));
         getTestOrderCoverageEnforce().convention(false);
+        if (isSubproject) {
+            getNativeHashFile().convention(localDir.dir("hashes").file(project.getName() + "-native-hashes.lz4"));
+        } else {
+            getNativeHashFile().convention(localDir.file("native-hashes.lz4"));
+        }
         // Score weight conventions intentionally omitted — when not explicitly configured,
         // PriorityClassOrderer uses weights from the state file (possibly optimizer-tuned)
         // or its own built-in defaults (newTest=100, changedTest=80, maxFailure=60, etc.).
