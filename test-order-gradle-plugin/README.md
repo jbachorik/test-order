@@ -321,6 +321,7 @@ All tasks are in the `test-order` group:
 | `testOrderSnapshot` | `test-order:snapshot` | Create hash snapshot for since-last-run change detection |
 | `testOrderPrepare` | `test-order:prepare` | Validate configuration, restore offline classes, print what mode would be used |
 | `testOrderDownload` | `test-order:download` | Download dependency index from CI artifacts |
+| `testOrderNativeCollect` | — | Merge per-test native coverage artifacts + JNI cross-check edges into the index (requires `nativeTests` config; Gradle only) |
 
 ### Reporting and inspection
 
@@ -392,6 +393,77 @@ testOrder {
 ```
 
 Tier files are written to `build/test-order-tier1.txt`, `build/test-order-tier2.txt`, `build/test-order-tier3.txt`.
+
+## Native tests (C/C++)
+
+Native (C/C++) sources are invisible to Java-source change detection. Declare
+a `nativeTests` block to track them:
+
+```groovy
+testOrder {
+    nativeTests {
+        sourceRoots = files("src/profiling")          // C/C++ sources tracked for changes
+        coverageDir = layout.buildDirectory.dir("native-coverage") // per-test gcov artifacts
+        binaries = files("build/libprofiling.so")     // optional; reserved for future use
+    }
+}
+```
+
+When `nativeTests` is configured (and only then):
+
+- **Change detection** hashes the declared `sourceRoots` (`.cpp`, `.cc`, `.c`,
+  `.cxx`, `.c++`, `.hpp`, `.hh`, `.h`, `.hxx`) into
+  `.test-order/native-hashes.lz4` and treats changed files as changed units —
+  tests with native edges get selected exactly like tests depending on changed
+  Java classes. In `explicit` change mode only the explicit class list is used
+  (there is no explicit native-path input yet).
+- **`testOrderNativeCollect`** merges per-test native coverage artifacts from
+  `coverageDir` and Java↔native cross-check edges into the dependency index.
+  Run it after your native test/coverage step:
+
+  ```bash
+  ./gradlew nativeTests testOrderNativeCollect
+  ```
+
+### Native coverage artifacts
+
+`testOrderNativeCollect` accepts three artifact shapes in `coverageDir` —
+anything not parseable is skipped with a warning, and a test that crashed loses
+its gcov data (its edges are simply missing; sancov collection is a planned
+follow-up):
+
+1. **Generic per-test JSON** — `*.json` files with
+   `{"test": "com.example.FooTest", "coveredFiles": ["src/profiling/foo.cpp"]}`.
+   The `test` field wins; when absent, the filename stem must be the test FQCN
+   (e.g. `com.example.FooTest.json`).
+2. **Generic JSONL** — `*.jsonl` files, one `{"test": ..., "coveredFiles": [...}]`
+   object per line; `test` is required per line.
+3. **gcovr JSON** — `*.json` files with gcovr's `--json` output
+   (`{"files": [{"file": "...", ...}, ...]}`); the test name comes from the
+   filename stem.
+
+Covered paths may be absolute or relative to the project root. Only files
+under the declared `sourceRoots` are indexed; everything else is dropped with
+a warning. Native units are stored in the index as project-root-relative
+forward-slash paths (e.g. `src/profiling/foo.cpp`).
+
+### Java↔native cross-check
+
+The collect task scans `sourceRoots` for JNI exports
+(`Java_<package>_<Class>_<method>` naming) and intersects them with the
+MEMBER-mode dependency index: a test whose profile exercises an exported method
+gains an edge to the source file exporting it — so a C++ change selects the
+Java tests whose profiles exercise the changed native entry points even without
+gcov data. Underscore escaping (`_1`) and overload suffixes (`__<signature>`)
+are handled; nested-class vs. underscore-package ambiguity can demangle to
+FQCNs that match nothing, which is harmless.
+
+### gcov data prerequisites
+
+The consumer build is responsible for producing the artifacts — e.g. set
+`GCOV_PREFIX` per forked test JVM, run the native tests, then convert the
+per-test `.gcda` files (gcovr `--json` per test is the natural source of the
+accepted shapes).
 
 ## How it works
 
@@ -469,6 +541,7 @@ When no scoring weights are set in the DSL, the plugin uses optimizer-tuned valu
 | `.test-order/state.lz4` | Optional | Test durations, failure history, run records |
 | `.test-order/ml/history.lz4` | Optional | ML run history (when `ml.enabled=true`) |
 | `.test-order/hashes.lz4` | No | Source hash snapshot for since-last-run change detection |
+| `.test-order/native-hashes.lz4` | No | Native source hash snapshot (when `nativeTests` is configured) |
 | `build/test-order-deps/` | No | Intermediate `.deps` files (cleaned by `testOrderClean`) |
 
 ## ML Failure Predictions

@@ -2,7 +2,7 @@
 
 Technical specification for `.test-order/test-dependencies.lz4`.
 
-This document describes the current binary data format: format version 1.
+This document describes the current binary data format: format version 2.
 
 ## Quick Reference
 
@@ -11,7 +11,7 @@ This document describes the current binary data format: format version 1.
 | File Name | `test-dependencies.lz4` |
 | Container | LZ4 frame (`LZ4FrameOutputStream`) |
 | Inner Magic | `TORD` (4 bytes) |
-| Format Version | `1` (2-byte signed short, big-endian) |
+| Format Version | `2` (2-byte signed short, big-endian) |
 | Payload Layout | Section-based (`type + length + payload`) |
 | String Encoding | UTF-8 (`DataOutputStream.writeUTF` where applicable) |
 
@@ -49,10 +49,12 @@ Unknown section types are skipped by length, enabling forward-compatible readers
 
 ### 2. Format Version (2 bytes)
 
-- Current: `1`
+- Current: `2`
+- Supported: `1` (read-only, upgraded on next save), `2`
 - Type: signed short (big-endian)
 - Reader behavior:
-- `1`: supported
+- `1`: supported (v1 indexes never contain path-keyed native deps)
+- `2`: supported
 - anything else: fail with "Unsupported dependency index format version"
 
 ### 3. Section Count (4 bytes)
@@ -148,6 +150,31 @@ repeat ENTRY_COUNT times:
 
 - `METHOD_KEY` format: `className#methodName`
 - `MEMBER_KEY` format: `depClass#member`
+
+## Version 2: Native Dependency Units
+
+Format version 2 exists to allow **native source-file paths** as dependency
+units alongside Java FQCNs. Consumers that configure `testOrder { nativeTests
+{ ... } }` (Gradle only) record `testClass → native source file` edges produced
+by `testOrderNativeCollect`:
+
+- gcov-derived edges: per-test coverage artifacts parsed from the declared
+  coverage directory
+- Java↔native cross-check edges: a test whose MEMBER-mode dependencies include
+  a JNI-exported method (`Java_<class>_<method>` naming) gains an edge to the
+  source file exporting it
+
+Native units are plain strings containing `/` (e.g. `src/profiling/foo.cpp`,
+always relative to the project root, forward slashes); they live in the same
+trie dictionary and dependency bitmaps as FQCNs, so scoring, closure, and
+change-detection overlap work on them unchanged. `testOrderNativeCollect`
+merges them directly into the binary index; a `.deps`-file rebuild (compact)
+also carries over native deps from the previous index.
+
+A version 1 reader rejects a v2 file; a v2 reader accepts v1 files. Bumping
+the version (instead of adding a new section type inside v1) makes older
+readers fail loudly instead of silently dropping native edges when they
+rewrite the shared index.
 
 ## Validation and Limits
 
