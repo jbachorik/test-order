@@ -1049,15 +1049,21 @@ public class TestOrderPlugin implements Plugin<Project> {
         // task triggered it.
         testTask.finalizedBy("testOrderOfflineRestore");
 
-        // Add runtime jar to test classpath (UsageStore accessible without agent).
-        // Use a per-task name so that multiple Test tasks in the same project each
-        // get their own configuration — avoids "cannot mutate after resolved" errors
-        // when a second task's configureEach fires after the first config was resolved.
-        String runtimeConfName = "testOrderOfflineRuntime_" + testTask.getName();
-        Configuration runtimeConf = createHiddenConfiguration(project, runtimeConfName, false);
-        project.getDependencies().add(runtimeConf.getName(),
-                GROUP_ID + ":test-order-agent:" + VERSION);
-        testTask.setClasspath(testTask.getClasspath().plus(runtimeConf));
+        // Contribute the agent jar as a testRuntimeOnly dependency instead of appending
+        // it to the Test task classpath: convention plugins that reassign the Test task
+        // classpath wholesale (e.g. `test.classpath = customConf`) wipe a task-classpath
+        // append, which left offline learn dying with "OfflineRuntimeBootstrap class not
+        // found". A runtime dependency contributes through testRuntimeClasspath no matter
+        // how the task classpath is reassigned afterwards. testRuntimeOnly is project-wide
+        // (one dependency serves every Test task in the project), so guard against
+        // duplicate declarations across tasks.
+        if (!project.getExtensions().getExtraProperties().has("testorder.offlineRuntimeAdded")) {
+            project.getExtensions().getExtraProperties().set("testorder.offlineRuntimeAdded", Boolean.TRUE);
+            ExternalModuleDependency agentDep = (ExternalModuleDependency) project.getDependencies().create(
+                    GROUP_ID + ":test-order-agent:" + VERSION);
+            agentDep.setTransitive(false);
+            project.getDependencies().add("testRuntimeOnly", agentDep);
+        }
     }
 
     /**

@@ -3,6 +3,7 @@ package me.bechberger.testorder.gradle;
 import org.gradle.api.Project;
 import org.gradle.api.file.DirectoryProperty;
 import org.gradle.api.file.RegularFileProperty;
+import org.gradle.api.invocation.Gradle;
 import org.gradle.api.provider.Property;
 
 /**
@@ -318,6 +319,24 @@ public abstract class TestOrderExtension {
         // level (like Maven's ReactorContext). This ensures a single shared index
         // across all subprojects without requiring manual configuration.
         var rootDir = project.getRootProject().getLayout().getProjectDirectory();
+        // Included build (composite participant or buildSrc): the PARENT build is where
+        // `mode=learn` runs write the index and where the composite's shared test-order
+        // state lives. Resolve to the parent build's root so order mode inside an
+        // included build sees the composite's index instead of silently degrading to
+        // skip mode ("Index file ... not found — skipping order mode"). Conventions
+        // only — an explicitly set indexFile/stateFile still wins. If cross-build
+        // access is refused (e.g. configuration-cache restrictions), fall back to
+        // this build's own root.
+        Gradle parentBuild = project.getGradle().getParent();
+        if (parentBuild != null) {
+            try {
+                rootDir = parentBuild.getRootProject().getLayout().getProjectDirectory();
+            } catch (RuntimeException e) {
+                project.getLogger().debug(
+                        "[test-order] Could not resolve parent build root for included-build "
+                                + "index sharing: {}", e.getMessage());
+            }
+        }
         var localDir = rootDir.dir(".test-order");
 
         getIndexFile().convention(localDir.file("test-dependencies.lz4"));

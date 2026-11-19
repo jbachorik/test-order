@@ -188,7 +188,10 @@ class TestOrderPluginIntegrationTest {
 
     private GradleRunner runner(String... args) {
         return GradleRunner.create()
-                .withGradleVersion("8.14.3")
+                // Pinned to the Gradle version the downstream consumers run (9.9.1);
+                // 8.14.3-era pins cannot parse JDK 25 class files ("Unsupported class
+                // file major version 69"), so TestKit on a Java 25 host failed.
+                .withGradleVersion("9.9.1")
                 .withProjectDir(projectDir.toFile())
                 .withArguments(args)
                 .forwardOutput();
@@ -468,6 +471,108 @@ class TestOrderPluginIntegrationTest {
         assertEquals(SUCCESS, result.task(":testOrderAffected").getOutcome());
         assertTrue(Files.exists(projectDir.resolve(".test-order/test-dependencies.lz4")),
                 "The index must exist after the order-mode run (pending .deps merged in the same build)");
+    }
+
+    @Test
+    @DisplayName("order mode inside an included build resolves the composite (parent) index")
+    void includedBuildResolvesCompositeIndex() throws Exception {
+        scaffoldProject();
+        // Included build with its own settings (plugin resolved from mavenLocal —
+        // TestKit plugin classpath injection does not reach included builds).
+        writeFile("included-lib/settings.gradle", """
+                pluginManagement {
+                    repositories {
+                        mavenLocal()
+                        gradlePluginPortal()
+                        mavenCentral()
+                    }
+                }
+                rootProject.name = 'included-lib'
+                """);
+        writeFile("included-lib/build.gradle", """
+                plugins {
+                    id 'java'
+                    id 'me.bechberger.test-order' version '0.1.1'
+                }
+                group = 'com.example.inc'
+                version = '1.0.0'
+                repositories {
+                    mavenLocal()
+                    mavenCentral()
+                }
+                dependencies {
+                    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
+                    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.11.4'
+                }
+                test {
+                    useJUnitPlatform()
+                }
+                """);
+        writeFile("included-lib/src/test/java/com/example/inc/IncTest.java", """
+                package com.example.inc;
+                import org.junit.jupiter.api.Test;
+                class IncTest {
+                    @Test void passes() {}
+                }
+                """);
+        // Composite: main build includes included-lib.
+        writeFile("settings.gradle", """
+                pluginManagement {
+                    repositories {
+                        mavenLocal()
+                        gradlePluginPortal()
+                        mavenCentral()
+                    }
+                }
+                rootProject.name = 'test-project'
+                includeBuild 'included-lib'
+                """);
+
+        // Learn in the MAIN build writes the composite index at main/.test-order.
+        runner("test", "-Dtestorder.mode=learn").build();
+        assertTrue(Files.exists(projectDir.resolve(".test-order/test-dependencies.lz4")));
+
+        // Order mode inside the INCLUDED build must resolve the parent build's index.
+        // Without the composite resolution it would look at included-lib/.test-order,
+        // find nothing, and print "Index file ... not found — skipping order mode".
+        // --info is needed because the order-mode confirmation logs at info level.
+        BuildResult result = runner(":included-lib:test", "-Dtestorder.mode=order", "--info").build();
+
+        String output = result.getOutput();
+        assertTrue(output.contains("Configuring order mode"),
+                "included build must resolve the composite index and configure order mode:\n" + output);
+        assertFalse(output.contains("skipping order mode"),
+                "included build must NOT degrade to skip mode:\n" + output);
+    }
+
+    @Test
+    @DisplayName("offline learn survives a convention plugin reassigning the Test task classpath")
+    void offlineLearnSurvivesTestClasspathReassignment() throws Exception {
+        scaffoldProject();
+        // Simulate convention plugins (e.g. Datadog ProfilerTestPlugin) that replace
+        // the Test task classpath wholesale. A task-classpath append (the previous
+        // wiring) is wiped by this; a testRuntimeOnly contribution survives it. The
+        // simulated reassignment keeps the test classes output (as real convention
+        // plugins do) and replaces the dependency classpath wholesale.
+        writeFile("reassign-classpath.gradle", """
+                def customConf = configurations.create('reassignedTestClasspath')
+                afterEvaluate {
+                    customConf.extendsFrom(configurations.testRuntimeClasspath)
+                    tasks.named('test') { classpath = sourceSets.main.output + sourceSets.test.output + customConf }
+                }
+                """);
+        // Append the apply from the existing build.gradle.
+        String build = Files.readString(projectDir.resolve("build.gradle"));
+        Files.writeString(projectDir.resolve("build.gradle"),
+                build + "\napply from: 'reassign-classpath.gradle'\n");
+
+        BuildResult result = runner("test", "-Dtestorder.mode=learn").build();
+
+        assertEquals(SUCCESS, result.task(":test").getOutcome(),
+                "offline learn must not die with 'OfflineRuntimeBootstrap class not found' "
+                        + "when the classpath is reassigned:\n" + result.getOutput());
+        assertTrue(Files.exists(projectDir.resolve(".test-order/test-dependencies.lz4")),
+                "offline learn must still write the index under a reassigned classpath");
     }
 
     @Test
@@ -787,7 +892,7 @@ class TestOrderPluginIntegrationTest {
 
         Path initScript = projectDir.resolve("test-order-init.gradle");
         BuildResult result = GradleRunner.create()
-                .withGradleVersion("8.14.3")
+                .withGradleVersion("9.9.1")
                 .withProjectDir(projectDir.toFile())
                 .withArguments("test", "-Dtestorder.mode=learn",
                         "--init-script", initScript.toString())
