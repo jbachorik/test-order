@@ -212,9 +212,13 @@ class PriorityClassOrdererTest {
 	}
 
 	@Test
-	void unknownTestClassGetsNewTestBonus() throws IOException {
+	void unknownTestClassDoesNotOutrankOnWarmIndex() throws IOException {
+		// Non-cold index: an unknown (absent) test class does not receive the
+		// newTest bonus and must not outrank the change-affected indexed test.
 		DependencyMap map = new DependencyMap();
 		map.put(String.class.getName(), Set.of("com.X"));
+		// Second entry keeps com.X below the ubiquitous-dep threshold.
+		map.put(Double.class.getName(), Set.of("com.Z"));
 		Path idx = tempDir.resolve("test.idx");
 		map.save(idx);
 
@@ -226,8 +230,9 @@ class PriorityClassOrdererTest {
 		List<StubClassDescriptor> descs = new ArrayList<>(List.of(desc(Integer.class), desc(String.class)));
 		orderer.orderClasses(new StubClassOrdererContext(descs));
 
-		// String: dep=1, Integer: new=15 → Integer first
-		assertEquals(Integer.class.getName(), descs.get(0).getTestClass().getName());
+		// String: dep overlap with the change = 1; Integer: unknown, no bonus
+		assertEquals(String.class.getName(), descs.get(0).getTestClass().getName());
+		assertEquals(Integer.class.getName(), descs.get(1).getTestClass().getName());
 	}
 
 	@Test
@@ -291,22 +296,29 @@ class PriorityClassOrdererTest {
 	}
 
 	@Test
-	void newTestClassesGetBonus() throws IOException {
+	void absentTestDoesNotOutrankChangeAffectedTest() throws IOException {
+		// Non-cold index: since c17c6b7c the newTest bonus applies only while the
+		// index is cold — a test absent from a partially learned index must not
+		// outrank a test whose dependencies overlap the change set.
 		DependencyMap map = new DependencyMap();
 		map.put(String.class.getName(), Set.of("com.X"));
+		// Second entry keeps com.X below the ubiquitous-dep threshold (1/2 < 0.90)
+		// so String's change overlap actually scores.
+		map.put(Double.class.getName(), Set.of("com.Z"));
 		Path idx = tempDir.resolve("test.idx");
 		map.save(idx);
 
 		System.setProperty("testorder.index.path", idx.toString());
-		System.setProperty("testorder.changed.classes", "");
+		System.setProperty("testorder.changed.classes", "com.X");
 		System.setProperty("testorder.state.path", "");
 
 		PriorityClassOrderer orderer = new PriorityClassOrderer();
-		List<StubClassDescriptor> descs = new ArrayList<>(List.of(desc(String.class), desc(Integer.class)));
+		List<StubClassDescriptor> descs = new ArrayList<>(List.of(desc(Integer.class), desc(String.class)));
 		orderer.orderClasses(new StubClassOrdererContext(descs));
 
-		assertEquals(Integer.class.getName(), descs.get(0).getTestClass().getName());
-		assertEquals(String.class.getName(), descs.get(1).getTestClass().getName());
+		// String: dep overlap with the change = 1; Integer: absent, no bonus
+		assertEquals(String.class.getName(), descs.get(0).getTestClass().getName());
+		assertEquals(Integer.class.getName(), descs.get(1).getTestClass().getName());
 	}
 
 	@Test
@@ -314,6 +326,9 @@ class PriorityClassOrdererTest {
 		DependencyMap map = new DependencyMap();
 		map.put(String.class.getName(), Set.of("com.X", "com.Y"));
 		map.put(Integer.class.getName(), Set.of("com.X"));
+		// Third entry keeps com.X below the ubiquitous-dep threshold (2/3 < 0.90)
+		// so the change overlaps of String and Integer actually score.
+		map.put(Double.class.getName(), Set.of("com.Z"));
 		Path idx = tempDir.resolve("test.idx");
 		map.save(idx);
 
@@ -331,10 +346,12 @@ class PriorityClassOrdererTest {
 				List.of(desc(Long.class), desc(Integer.class), desc(String.class)));
 		orderer.orderClasses(new StubClassOrdererContext(descs));
 
-		// Long: new=15; String: dep=2+fail≈2=4; Integer: dep=1
-		assertEquals(Long.class.getName(), descs.get(0).getTestClass().getName());
-		assertEquals(String.class.getName(), descs.get(1).getTestClass().getName());
-		assertEquals(Integer.class.getName(), descs.get(2).getTestClass().getName());
+		// Long: absent — no newTest bonus on a non-cold index (c17c6b7c);
+		// String: dep overlap 2 (com.X + com.Y both changed) + failure bonus;
+		// Integer: dep overlap 1 (com.X).
+		assertEquals(String.class.getName(), descs.get(0).getTestClass().getName());
+		assertEquals(Integer.class.getName(), descs.get(1).getTestClass().getName());
+		assertEquals(Long.class.getName(), descs.get(2).getTestClass().getName());
 	}
 
 	@Test
@@ -510,9 +527,11 @@ class PriorityClassOrdererTest {
 	// --- Tests for configurable scoring ---
 
 	@Test
-	void customNewTestBonus() throws IOException {
+	void customWeightsAbsentTestDoesNotOutrankAffected() throws IOException {
 		DependencyMap map = new DependencyMap();
 		map.put(String.class.getName(), Set.of("com.X"));
+		// Second entry keeps com.X below the ubiquitous-dep threshold.
+		map.put(Double.class.getName(), Set.of("com.Z"));
 		Path idx = tempDir.resolve("test.idx");
 		map.save(idx);
 
@@ -526,9 +545,10 @@ class PriorityClassOrdererTest {
 		List<StubClassDescriptor> descs = new ArrayList<>(List.of(desc(Integer.class), desc(String.class)));
 		orderer.orderClasses(new StubClassOrdererContext(descs));
 
-		// String: dep=1; Integer: newTest=2 → Integer first
-		assertEquals(Integer.class.getName(), descs.get(0).getTestClass().getName());
-		assertEquals(String.class.getName(), descs.get(1).getTestClass().getName());
+		// Non-cold index: custom newTest weight is gated off for absent tests;
+		// String: dep overlap = 1 → first; Integer: absent → second
+		assertEquals(String.class.getName(), descs.get(0).getTestClass().getName());
+		assertEquals(Integer.class.getName(), descs.get(1).getTestClass().getName());
 	}
 
 	@Test
@@ -628,9 +648,11 @@ class PriorityClassOrdererTest {
 	// --- Tests that would have caught the isNew bug ---
 
 	@Test
-	void changedTestNotInIndexGetsNewTestBonus() throws IOException {
+	void changedTestNotInIndexDoesNotOutrankAffectedOnWarmIndex() throws IOException {
 		DependencyMap map = new DependencyMap();
 		map.put(String.class.getName(), Set.of("com.A"));
+		// Second entry keeps com.A below the ubiquitous-dep threshold.
+		map.put(Double.class.getName(), Set.of("com.B"));
 		Path idx = tempDir.resolve("test.idx");
 		map.save(idx);
 
@@ -642,9 +664,9 @@ class PriorityClassOrdererTest {
 		List<StubClassDescriptor> descs = new ArrayList<>(List.of(desc(String.class), desc(Integer.class)));
 		orderer.orderClasses(new StubClassOrdererContext(descs));
 
-		assertEquals(Integer.class.getName(), descs.get(0).getTestClass().getName(),
-				"New test classes (not in index) must get NEW_TEST_BONUS");
-		assertEquals(String.class.getName(), descs.get(1).getTestClass().getName());
+		assertEquals(String.class.getName(), descs.get(0).getTestClass().getName(),
+				"Change-affected indexed test must outrank a test that is absent from a non-cold index");
+		assertEquals(Integer.class.getName(), descs.get(1).getTestClass().getName());
 	}
 
 	@Test
