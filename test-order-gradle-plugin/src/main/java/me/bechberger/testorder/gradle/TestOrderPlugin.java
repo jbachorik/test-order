@@ -3009,6 +3009,7 @@ public class TestOrderPlugin implements Plugin<Project> {
                 .bytecodeHashFile(ext.getBytecodeHashFile().get().getAsFile().toPath())
                 .nativeHashFile(ext.getNativeHashFile().get().getAsFile().toPath())
                 .nativeRoots(resolveNativeRoots(project, ext))
+                .nativeProjects(aggregateNativeProjects(project, ext))
                 .bytecodeChangeDetectionEnabled(ext.getBytecodeChangeDetectionEnabled().get())
                 .bytecodeAugmentDependencyMapEnabled(ext.getBytecodeAugmentDependencyMapEnabled().get())
                 .changeMode(resolveChangeMode(project, ext))
@@ -3445,6 +3446,39 @@ public class TestOrderPlugin implements Plugin<Project> {
             roots.add(root);
         }
         return roots;
+    }
+
+    /**
+     * Aggregates nativeTests declarations from every project in the build (one
+     * entry per declaring project, with its own key base and hash snapshot). A
+     * workflow running on a project without nativeTests (the common
+     * multi-project shape: :lib owns the natives, :test runs the workflow) still
+     * detects native changes owned by sibling projects. Per-project resolution
+     * failures degrade to a warning, never break the workflow.
+     */
+    static List<PluginContext.NativeProjectEntry> aggregateNativeProjects(Project project, TestOrderExtension ext) {
+        List<PluginContext.NativeProjectEntry> entries = new ArrayList<>();
+        for (Project p : project.getRootProject().getAllprojects()) {
+            try {
+                TestOrderExtension other = p.getExtensions().findByType(TestOrderExtension.class);
+                if (other == null) {
+                    continue;
+                }
+                List<Path> roots = resolveNativeRoots(p, other);
+                if (roots.isEmpty()) {
+                    continue;
+                }
+                entries.add(new PluginContext.NativeProjectEntry(
+                        p.getProjectDir().toPath().toAbsolutePath().normalize(),
+                        other.getNativeHashFile().get().getAsFile().toPath(),
+                        roots));
+            } catch (RuntimeException e) {
+                project.getLogger().warn(
+                        "[test-order] Failed to resolve nativeTests of {} — skipping its native change "
+                                + "detection: {}", p.getPath(), e.getMessage());
+            }
+        }
+        return entries;
     }
 
     /** Coverage directory declared for native collect, or null when not set. */

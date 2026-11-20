@@ -75,6 +75,7 @@ public final class PluginContext {
 	private final Path bytecodeHashFile;
 	private final Path nativeHashFile;
 	private final List<Path> nativeRoots;
+	private final List<NativeProjectEntry> nativeProjects;
 
 	// ── Change detection config ──────────────────────────────────────
 	private final String changeMode;
@@ -156,6 +157,18 @@ public final class PluginContext {
 		this.bytecodeHashFile = b.bytecodeHashFile;
 		this.nativeHashFile = b.nativeHashFile;
 		this.nativeRoots = b.nativeRoots != null ? List.copyOf(b.nativeRoots) : List.of();
+		// Normalize the native declarations into per-project entries: explicit
+		// aggregated entries win (the Gradle plugin aggregates across the build);
+		// otherwise the single-project fields synthesize one entry so consumers of
+		// nativeProjects() see a uniform view regardless of how the context was built.
+		if (b.nativeProjects != null) {
+			this.nativeProjects = List.copyOf(b.nativeProjects);
+		} else if (!this.nativeRoots.isEmpty() && this.nativeHashFile != null) {
+			this.nativeProjects = List
+					.of(new NativeProjectEntry(this.nativeProjectRoot, this.nativeHashFile, this.nativeRoots));
+		} else {
+			this.nativeProjects = List.of();
+		}
 		this.changeMode = b.changeMode;
 		this.changedClasses = b.changedClasses;
 		this.changedTestClasses = b.changedTestClasses;
@@ -258,6 +271,26 @@ public final class PluginContext {
 	 */
 	public List<Path> nativeRoots() {
 		return nativeRoots;
+	}
+
+	/**
+	 * A native declaration owned by one project: the project's directory as the
+	 * unit-key base, its hash snapshot file, and its declared roots. Native unit
+	 * keys are owning-project-relative, so each entry detects with its own base.
+	 */
+	public record NativeProjectEntry(Path keyBase, Path hashFile, List<Path> roots) {
+		public NativeProjectEntry {
+			roots = roots != null ? List.copyOf(roots) : List.of();
+		}
+	}
+
+	/**
+	 * Native declarations aggregated across the build (one entry per project with a
+	 * non-empty nativeTests). A workflow running on a project without nativeTests
+	 * still detects native changes owned by sibling projects.
+	 */
+	public List<NativeProjectEntry> nativeProjects() {
+		return nativeProjects;
 	}
 
 	public String changeMode() {
@@ -419,6 +452,7 @@ public final class PluginContext {
 		private Path bytecodeHashFile;
 		private Path nativeHashFile;
 		private List<Path> nativeRoots;
+		private List<NativeProjectEntry> nativeProjects;
 		private String changeMode;
 		private String changedClasses;
 		private String changedTestClasses;
@@ -531,6 +565,11 @@ public final class PluginContext {
 
 		public Builder nativeRoots(List<Path> v) {
 			this.nativeRoots = v;
+			return this;
+		}
+
+		public Builder nativeProjects(List<NativeProjectEntry> v) {
+			this.nativeProjects = v;
 			return this;
 		}
 		public Builder changeMode(String v) {

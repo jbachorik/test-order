@@ -333,20 +333,26 @@ public final class ChangeAnalysis {
 		// When the consumer declares testOrder { nativeTests { sourceRoots } },
 		// changed .cpp/.h files join the changed-unit universe as path-keyed deps so
 		// both native-edge tests (gcov/JNI cross-check) and Java tests get scored.
+		// Entries are aggregated across the build (one per declaring project): each
+		// entry detects with its OWN key base and hash snapshot, because native unit
+		// keys are owning-project-relative. Without the aggregation, a workflow
+		// running on a project without nativeTests (e.g. :ddprof-test while
+		// :ddprof-lib owns the natives) would never see native changes at all.
 		// Explicit changed-class lists stay authoritative (same BUG-165 contract as
 		// the bytecode detection below) — native detection is skipped when one is set.
-		if (!ctx.nativeRoots().isEmpty() && ctx.nativeHashFile() != null) {
+		if (!ctx.nativeProjects().isEmpty()) {
 			boolean explicitChangedClassesSet = ctx.changedClasses() != null && !ctx.changedClasses().isBlank();
 			if (!explicitChangedClassesSet && !"explicit".equalsIgnoreCase(ctx.changeMode())) {
 				final Set<String> nativeChanged = new java.util.LinkedHashSet<>();
-				try {
-					var mode = ChangeDetectionSupport.resolveMode(ctx.changeMode(), ctx.nativeHashFile());
-					nativeChanged.addAll(
-							me.bechberger.testorder.changes.NativeChangeDetector.detect(mode, ctx.nativeProjectRoot(),
-									ctx.nativeRoots(), ctx.nativeHashFile(), null, true, sharedRepoSnapshot));
-				} catch (IOException e) {
-					ctx.log().warn("[test-order] Native change detection failed: " + e.getMessage()
-							+ " — falling back to no native changes");
+				for (PluginContext.NativeProjectEntry entry : ctx.nativeProjects()) {
+					try {
+						var mode = ChangeDetectionSupport.resolveMode(ctx.changeMode(), entry.hashFile());
+						nativeChanged.addAll(me.bechberger.testorder.changes.NativeChangeDetector.detect(mode,
+								entry.keyBase(), entry.roots(), entry.hashFile(), null, true, sharedRepoSnapshot));
+					} catch (IOException e) {
+						ctx.log().warn("[test-order] Native change detection failed for " + entry.keyBase() + ": "
+								+ e.getMessage() + " — falling back to no native changes for that project");
+					}
 				}
 				if (!nativeChanged.isEmpty()) {
 					Set<String> mergedChanged = new java.util.LinkedHashSet<>(changed);
