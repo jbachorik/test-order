@@ -25,11 +25,10 @@ import net.jpountz.lz4.LZ4FrameOutputStream;
  * {@link #load(Path)} reads v1 and v2.
  *
  * <p>
- * Version 2 differs from version 1 only in the <b>dependency-name
- * namespace</b>: dependency units may be native source-file paths (e.g.
- * {@code src/profiling/foo.cpp}, always containing {@code /}) alongside Java
- * FQCNs. Version 1 readers reject v2 files; version 2 readers accept v1 files
- * (v1 never contains path-keyed deps) and upgrade in place on the next save.
+ * Version 2 supports native source-file paths alongside Java FQCNs and stores
+ * explicit metadata identifying native dependency values. Version 1 readers
+ * reject v2 files; version 2 readers accept v1 files (which have no native
+ * identity section) and upgrade in place on the next save.
  *
  * <p>
  * Thread-safety: instance state is <b>not</b> thread-safe — concurrent mutation
@@ -102,6 +101,8 @@ public class DependencyMap {
 	 * fraction).
 	 */
 	static final short SECTION_UBIQUITOUS_DEPS = 9;
+	/** Section type: explicitly marked native unit dependency values. */
+	static final short SECTION_NATIVE_UNITS = 10;
 
 	private static final double DEFAULT_UBIQUITOUS_THRESHOLD = 0.90;
 
@@ -112,6 +113,12 @@ public class DependencyMap {
 	private Set<String> ubiquitousDeps = Collections.emptySet();
 
 	private final Map<String, Set<String>> dependencies;
+
+	/**
+	 * Dependency values known to be native unit keys; identity is explicit
+	 * metadata.
+	 */
+	private final Set<String> nativeUnits;
 
 	/** Cached unmodifiable view of dependency keys — live view, never stale. */
 	private final Set<String> testClassesView;
@@ -175,6 +182,7 @@ public class DependencyMap {
 
 	public DependencyMap() {
 		this.dependencies = new TreeMap<>();
+		this.nativeUnits = new HashSet<>();
 		this.methodDependencies = new HashMap<>();
 		this.memberKeyDictionary = new ArrayList<>();
 		this.memberKeyIndex = new LinkedHashMap<>();
@@ -215,6 +223,7 @@ public class DependencyMap {
 
 	public DependencyMap(Map<String, Set<String>> dependencies) {
 		this.dependencies = new TreeMap<>();
+		this.nativeUnits = new HashSet<>();
 		for (var e : dependencies.entrySet()) {
 			this.dependencies.put(e.getKey(), Collections.unmodifiableSet(new HashSet<>(e.getValue())));
 		}
@@ -549,6 +558,21 @@ public class DependencyMap {
 		return !testToModule.isEmpty();
 	}
 
+	/** Returns an unmodifiable view of explicitly marked native unit keys. */
+	public Set<String> nativeUnits() {
+		return Collections.unmodifiableSet(nativeUnits);
+	}
+
+	/** Whether a dependency value has explicit native-unit identity metadata. */
+	public boolean isNativeUnit(String dependency) {
+		return nativeUnits.contains(dependency);
+	}
+
+	/** Copies explicit native-unit identity into a filtered in-memory view. */
+	public void copyNativeUnitsTo(DependencyMap target) {
+		Objects.requireNonNull(target, "target").nativeUnits.addAll(nativeUnits);
+	}
+
 	/** Set of all module ids referenced by the test → module map. */
 	public Set<String> modules() {
 		return Collections.unmodifiableSet(new HashSet<>(testToModule.values()));
@@ -569,6 +593,7 @@ public class DependencyMap {
 			return this;
 		}
 		DependencyMap filtered = new DependencyMap();
+		filtered.nativeUnits.addAll(nativeUnits);
 		int excluded = 0;
 		for (var entry : dependencies.entrySet()) {
 			String testClass = entry.getKey();
@@ -651,6 +676,7 @@ public class DependencyMap {
 				testToModule.put(entry.getKey(), entry.getValue());
 			}
 		}
+		nativeUnits.addAll(other.nativeUnits);
 		invalidateCaches();
 		// Recompute ubiquitous deps after merge — the merged map may have a different
 		// distribution
@@ -767,7 +793,25 @@ public class DependencyMap {
 		for (var e : methodMemberDepsMap.entrySet())
 			result.methodMemberDepsMap.put(e.getKey(), e.getValue().clone());
 		result.testToModule.putAll(testToModule);
+		result.nativeUnits.addAll(nativeUnits);
 		result.ubiquitousDeps = this.ubiquitousDeps;
+		return result;
+	}
+
+	/**
+	 * Returns a copy augmented with native edges and marks their dependency values
+	 * as native units. Generic augmentation deliberately does not mark new values.
+	 */
+	public DependencyMap withNativeAugmentation(Map<String, Set<String>> nativeDeps) {
+		if (nativeDeps == null || nativeDeps.isEmpty()) {
+			return this;
+		}
+		DependencyMap result = withAugmentation(nativeDeps);
+		for (Map.Entry<String, Set<String>> entry : nativeDeps.entrySet()) {
+			if (result.dependencies.containsKey(entry.getKey()) && entry.getValue() != null) {
+				result.nativeUnits.addAll(entry.getValue());
+			}
+		}
 		return result;
 	}
 
@@ -1056,6 +1100,8 @@ public class DependencyMap {
 			sectionCount++;
 		if (!testToModule.isEmpty())
 			sectionCount++;
+		if (!nativeUnits.isEmpty())
+			sectionCount++;
 		out.writeInt(sectionCount);
 
 		// ── Section: TRIE ────────────────────────────────────────
@@ -1225,6 +1271,16 @@ public class DependencyMap {
 			}
 			s.flush();
 			writeSection(out, SECTION_TEST_MODULE_MAP, buf.toByteArray());
+		}
+		if (!nativeUnits.isEmpty()) {
+			ByteArrayOutputStream buf = new ByteArrayOutputStream(nativeUnits.size() * 32);
+			DataOutputStream s = new DataOutputStream(buf);
+			s.writeInt(nativeUnits.size());
+			for (String unit : new TreeSet<>(nativeUnits)) {
+				s.writeUTF(unit);
+			}
+			s.flush();
+			writeSection(out, SECTION_NATIVE_UNITS, buf.toByteArray());
 		}
 	}
 
@@ -1688,6 +1744,16 @@ public class DependencyMap {
 							map.testToModule.put(testClass, moduleId);
 						}
 					}
+					case SECTION_NATIVE_UNITS -> {
+						byte[] payload = new byte[sectionLength];
+						in.readFully(payload);
+						DataInputStream s = new DataInputStream(new ByteArrayInputStream(payload));
+						int unitCount = s.readInt();
+						validateCount(unitCount, "nativeUnitCount");
+						for (int i = 0; i < unitCount; i++) {
+							map.nativeUnits.add(s.readUTF());
+						}
+					}
 					case SECTION_UBIQUITOUS_DEPS -> {
 						byte[] payload = new byte[sectionLength];
 						in.readFully(payload);
@@ -1965,6 +2031,61 @@ public class DependencyMap {
 			}
 			return null;
 		});
+	}
+
+	/**
+	 * Loads, derives, and merges native edges under one file lock. The derivation
+	 * callback receives the exact index instance used as the merge base and is
+	 * invoked even when {@code baseDeps} is empty. Native identity is attached to
+	 * dependency values from both edge sources.
+	 *
+	 * @return the edges returned by the derivation callback, or an empty map when
+	 *         the callback returns {@code null}
+	 */
+	public static Map<String, Set<String>> mergeFromAgentWithDerivedDeps(Path indexFile,
+			Map<String, Set<String>> baseDeps,
+			java.util.function.Function<DependencyMap, Map<String, Set<String>>> deriveDeps) throws IOException {
+		Objects.requireNonNull(deriveDeps, "deriveDeps");
+		Path indexParent = indexFile.toAbsolutePath().getParent();
+		if (indexParent != null) {
+			Files.createDirectories(indexParent);
+		}
+		Map<String, Set<String>> base = baseDeps == null ? Map.of() : baseDeps;
+		return PersistenceSupport.withFileLock(indexFile, () -> {
+			evictCache(indexFile);
+			DependencyMap map = Files.exists(indexFile) ? loadOrCreateFresh(indexFile) : new DependencyMap();
+			Map<String, Set<String>> derivedResult = deriveDeps.apply(map);
+			Map<String, Set<String>> derived = derivedResult == null ? Map.of() : derivedResult;
+			boolean hasBaseEdges = base.values().stream().anyMatch(values -> values != null && !values.isEmpty());
+			boolean hasDerivedEdges = derived.values().stream().anyMatch(values -> values != null && !values.isEmpty());
+			if (!hasBaseEdges && !hasDerivedEdges) {
+				return derived;
+			}
+			mergeNativeEdges(map, base);
+			mergeNativeEdges(map, derived);
+			map.invalidateCaches();
+			LZ4Support.Compression compression = LZ4Support.Compression
+					.fromString(System.getProperty("testorder.compression"));
+			map.save(indexFile, compression);
+			return derived;
+		});
+	}
+
+	private static void mergeNativeEdges(DependencyMap map, Map<String, Set<String>> edges) {
+		for (Map.Entry<String, Set<String>> entry : edges.entrySet()) {
+			Set<String> incoming = entry.getValue();
+			if (incoming == null || incoming.isEmpty()) {
+				continue;
+			}
+			map.dependencies.merge(entry.getKey(), Collections.unmodifiableSet(new HashSet<>(incoming)),
+					(existing, addition) -> {
+						Set<String> merged = new HashSet<>(existing.size() + addition.size());
+						merged.addAll(existing);
+						merged.addAll(addition);
+						return Collections.unmodifiableSet(merged);
+					});
+			map.nativeUnits.addAll(incoming);
+		}
 	}
 
 	/**

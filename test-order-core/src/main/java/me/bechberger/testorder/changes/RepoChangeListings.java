@@ -92,6 +92,10 @@ public final class RepoChangeListings {
 			return entry.statusPorcelainPaths();
 		}
 
+		List<StatusRecord> statusRecords() throws IOException {
+			return entry.statusRecords();
+		}
+
 		List<String> trackedPaths() throws IOException {
 			return entry.trackedPaths();
 		}
@@ -190,7 +194,7 @@ public final class RepoChangeListings {
 		private final Object lock = new Object();
 		private volatile Set<String> uncommittedPaths;
 		private volatile LastCommitData lastCommit;
-		private volatile List<String> statusPorcelainPaths;
+		private volatile List<StatusRecord> statusRecords;
 		private volatile List<String> trackedPaths;
 		private final Map<String, RefData> refs = new HashMap<>();
 
@@ -253,22 +257,33 @@ public final class RepoChangeListings {
 		}
 
 		/**
-		 * Parsed paths of {@code git status --porcelain --untracked-files=all},
-		 * repo-wide.
+		 * Parsed paths of {@code git status --porcelain -z --untracked-files=all},
+		 * repo-wide. The general detector contract includes both rename endpoints.
 		 */
 		List<String> statusPorcelainPaths() throws IOException {
-			List<String> paths = statusPorcelainPaths;
-			if (paths == null) {
+			List<String> paths = new ArrayList<>();
+			for (StatusRecord record : statusRecords()) {
+				if (record.origin() != null) {
+					paths.add(record.origin());
+				}
+				paths.add(record.path());
+			}
+			return List.copyOf(paths);
+		}
+
+		List<StatusRecord> statusRecords() throws IOException {
+			List<StatusRecord> records = statusRecords;
+			if (records == null) {
 				synchronized (lock) {
-					if (statusPorcelainPaths == null) {
-						List<String> lines = GitSupport.runGit(gitRoot, true, "status", "--porcelain",
+					if (statusRecords == null) {
+						byte[] output = GitSupport.runGitBytes(gitRoot, true, "status", "--porcelain", "-z",
 								"--untracked-files=all");
-						statusPorcelainPaths = parseStatusLines(lines);
+						statusRecords = parseStatusZ(output);
 					}
-					paths = statusPorcelainPaths;
+					records = statusRecords;
 				}
 			}
-			return paths;
+			return records;
 		}
 
 		/**
@@ -385,7 +400,46 @@ public final class RepoChangeListings {
 		}
 	}
 
-	/** Parses {@code status --porcelain} lines into repo-root-relative paths. */
+	/** One NUL-delimited porcelain status entry; rename/copy origin is optional. */
+	static record StatusRecord(String path, String origin) {
+	}
+
+	/**
+	 * Parses {@code status --porcelain -z} records without unquoting path bytes.
+	 */
+	static List<StatusRecord> parseStatusZ(byte[] statusOutput) {
+		String output = new String(statusOutput, StandardCharsets.UTF_8);
+		List<String> fields = new ArrayList<>();
+		int start = 0;
+		for (int i = 0; i < output.length(); i++) {
+			if (output.charAt(i) == 0) {
+				fields.add(output.substring(start, i));
+				start = i + 1;
+			}
+		}
+		if (start < output.length()) {
+			fields.add(output.substring(start));
+		}
+		List<StatusRecord> records = new ArrayList<>();
+		for (int i = 0; i < fields.size(); i++) {
+			String field = fields.get(i);
+			if (field.length() < 4 || field.charAt(2) != ' ') {
+				continue;
+			}
+			String status = field.substring(0, 2);
+			String path = field.substring(3);
+			String origin = null;
+			if ((status.indexOf('R') >= 0 || status.indexOf('C') >= 0) && i + 1 < fields.size()) {
+				origin = fields.get(++i);
+			}
+			records.add(new StatusRecord(path, origin));
+		}
+		return List.copyOf(records);
+	}
+
+	/**
+	 * Parses legacy line-oriented porcelain output into repo-root-relative paths.
+	 */
 	static List<String> parseStatusLines(List<String> statusLines) {
 		List<String> paths = new ArrayList<>();
 		for (String line : statusLines) {

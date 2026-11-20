@@ -116,6 +116,7 @@ public final class TestClassDiscovery {
 				? groupMethodKeysByClass(depMap.methodKeys())
 				: Map.of();
 		DependencyMap filtered = new DependencyMap();
+		depMap.copyNativeUnitsTo(filtered);
 		for (String testClass : moduleTests) {
 			if (depMap.testClasses().contains(testClass)) {
 				filtered.put(testClass, depMap.get(testClass));
@@ -200,6 +201,7 @@ public final class TestClassDiscovery {
 				? groupMethodKeysByClass(depMap.methodKeys())
 				: Map.of();
 		DependencyMap filtered = new DependencyMap();
+		depMap.copyNativeUnitsTo(filtered);
 		for (String testClass : depMap.testClasses()) {
 			// Match both outer classes and inner classes (e.g. OuterTest$Inner)
 			String outerClass = testClass.contains("$") ? testClass.substring(0, testClass.indexOf('$')) : testClass;
@@ -244,6 +246,7 @@ public final class TestClassDiscovery {
 				? groupMethodKeysByClass(depMap.methodKeys())
 				: Map.of();
 		DependencyMap filtered = new DependencyMap();
+		depMap.copyNativeUnitsTo(filtered);
 		for (String testClass : depMap.testClasses()) {
 			String recorded = depMap.getModule(testClass);
 			if (recorded != null && !recorded.equals(moduleId)) {

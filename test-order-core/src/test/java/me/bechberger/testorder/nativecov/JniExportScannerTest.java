@@ -78,13 +78,17 @@ class JniExportScannerTest {
 		Path root = tempDir.resolve("natives");
 		Path header = root.resolve("profiling/foo.h");
 		Path headerxx = root.resolve("profiling/bar.hxx");
+		Path sourcePlus = root.resolve("profiling/baz.c++");
 		Files.createDirectories(header.getParent());
 		Files.writeString(header, "void Java_com_example_Header_run(JNIEnv*, jobject) {}", StandardCharsets.UTF_8);
 		Files.writeString(headerxx, "void Java_com_example_Headerxx_run(JNIEnv*, jobject) {}", StandardCharsets.UTF_8);
+		Files.writeString(sourcePlus, "void Java_com_example_SourcePlus_run(JNIEnv*, jobject) {}",
+				StandardCharsets.UTF_8);
 
 		Map<String, Set<String>> exports = JniExportScanner.scan(tempDir, List.of(root));
 		assertEquals(Map.of("natives/profiling/foo.h", Set.of("com.example.Header#run"), "natives/profiling/bar.hxx",
-				Set.of("com.example.Headerxx#run")), exports);
+				Set.of("com.example.Headerxx#run"), "natives/profiling/baz.c++", Set.of("com.example.SourcePlus#run")),
+				exports);
 	}
 
 	@Test

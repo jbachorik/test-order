@@ -85,11 +85,19 @@ public final class IndexCompactionOperation {
 				DependencyMap previous = DependencyMap.load(outputFile);
 				Map<String, Set<String>> nativeDeps = new java.util.LinkedHashMap<>();
 				int nativeEdgeCount = 0;
+				int unmarkedPathCount = 0;
+				int absoluteNativeCount = 0;
 				for (String test : previous.testClasses()) {
 					Set<String> paths = new java.util.TreeSet<>();
 					for (String dep : previous.get(test)) {
-						if (dep.indexOf('/') >= 0) {
-							paths.add(dep);
+						if (previous.isNativeUnit(dep)) {
+							if (isAbsoluteNativeKey(dep)) {
+								absoluteNativeCount++;
+							} else {
+								paths.add(dep);
+							}
+						} else if (looksPathLike(dep)) {
+							unmarkedPathCount++;
 						}
 					}
 					if (!paths.isEmpty()) {
@@ -98,8 +106,15 @@ public final class IndexCompactionOperation {
 					}
 				}
 				if (!nativeDeps.isEmpty()) {
-					mergedMap = mergedMap.withAugmentation(nativeDeps);
+					mergedMap = mergedMap.withNativeAugmentation(nativeDeps);
 					log.info("Preserved " + nativeEdgeCount + " native edge(s) from the previous index");
+				}
+				if (absoluteNativeCount > 0) {
+					log.warn("Skipped " + absoluteNativeCount + " absolute native unit key(s) from the previous index");
+				}
+				if (unmarkedPathCount > 0) {
+					log.warn("Did not preserve " + unmarkedPathCount
+							+ " unmarked path-like dependency value(s); run native collect to repopulate native edges");
 				}
 			} catch (IOException e) {
 				log.warn("Could not preserve native edges from the existing index: " + e.getMessage());
@@ -146,6 +161,14 @@ public final class IndexCompactionOperation {
 		public long removedTests() {
 			return Math.max(0, beforeTestCount - afterTestCount);
 		}
+	}
+
+	private static boolean isAbsoluteNativeKey(String key) {
+		return key.startsWith("/") || key.matches("^[A-Za-z]:/.*");
+	}
+
+	private static boolean looksPathLike(String key) {
+		return key.indexOf('/') >= 0;
 	}
 
 	private static String formatBytes(long bytes) {

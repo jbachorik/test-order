@@ -297,12 +297,17 @@ public abstract class TestOrderExtension {
      * <pre>
      * testOrder {
      *     nativeTests {
-     *         sourceRoots = files("src/profiling")   // C/C++ sources, tracked for changes
+     *         sourceRoots = files("src/profiling")   // relative to this project; must stay under its directory
      *         coverageDir = layout.buildDirectory.dir("native-coverage") // per-test gcov artifacts
      *         binaries = files("build/lib")          // optional; reserved for future use
      *     }
      * }
      * </pre>
+     * Relative source roots and relative paths inside coverage artifacts use the
+     * directory of the project declaring {@code nativeTests} as their base. Roots
+     * outside that directory are ignored with a warning. Native unit keys use the
+     * same project-relative base; subprojects sharing an index can have colliding
+     * keys, which may select extra tests but does not miss tests.
      */
     @Nested
     public abstract NativeTests getNativeTests();
@@ -314,10 +319,18 @@ public abstract class TestOrderExtension {
 
     /** Native test configuration (see {@link #getNativeTests()}). */
     public abstract static class NativeTests {
-        /** Native source roots (C/C++ source directories) tracked for change detection. */
+        /**
+         * Native source roots (C/C++ source directories) tracked for change detection.
+         * Relative roots are resolved against the project declaring {@code nativeTests};
+         * roots outside that project directory are ignored with a warning.
+         */
         public abstract ConfigurableFileCollection getSourceRoots();
 
-        /** Directory containing per-test native coverage artifacts consumed by {@code testOrderNativeCollect}. */
+        /**
+         * Directory containing per-test native coverage artifacts consumed by
+         * {@code testOrderNativeCollect}. Relative covered-file paths in those artifacts
+         * are resolved against the project declaring {@code nativeTests}.
+         */
         public abstract DirectoryProperty getCoverageDir();
 
         /**

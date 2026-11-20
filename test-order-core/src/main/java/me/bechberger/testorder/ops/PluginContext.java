@@ -46,6 +46,12 @@ public final class PluginContext {
 	// ── Path config ──────────────────────────────────────────────────
 	private final Path projectRoot;
 	/**
+	 * Base directory for native source roots, coverage paths, snapshots, and unit
+	 * keys. Defaults to projectRoot for callers that do not configure a separate
+	 * native base.
+	 */
+	private final Path nativeProjectRoot;
+	/**
 	 * Git repository root — may span multiple modules; null means use projectRoot.
 	 */
 	private final Path repoRoot;
@@ -133,6 +139,7 @@ public final class PluginContext {
 
 	private PluginContext(Builder b) {
 		this.projectRoot = b.projectRoot;
+		this.nativeProjectRoot = b.nativeProjectRoot != null ? b.nativeProjectRoot : b.projectRoot;
 		this.repoRoot = b.repoRoot;
 		this.sourceRoot = b.sourceRoot;
 		this.testSourceRoot = b.testSourceRoot;
@@ -188,6 +195,14 @@ public final class PluginContext {
 
 	public Path projectRoot() {
 		return projectRoot;
+	}
+
+	/**
+	 * Base directory for native roots, relative coverage artifact paths, and native
+	 * unit keys.
+	 */
+	public Path nativeProjectRoot() {
+		return nativeProjectRoot;
 	}
 
 	/**
@@ -387,6 +402,7 @@ public final class PluginContext {
 
 	public static final class Builder {
 		private Path projectRoot;
+		private Path nativeProjectRoot;
 		private Path repoRoot;
 		private Path sourceRoot;
 		private Path testSourceRoot;
@@ -442,6 +458,11 @@ public final class PluginContext {
 
 		public Builder projectRoot(Path v) {
 			this.projectRoot = v;
+			return this;
+		}
+
+		public Builder nativeProjectRoot(Path v) {
+			this.nativeProjectRoot = v;
 			return this;
 		}
 

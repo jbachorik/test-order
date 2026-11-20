@@ -341,8 +341,8 @@ public final class ChangeAnalysis {
 				final Set<String> nativeChanged = new java.util.LinkedHashSet<>();
 				try {
 					var mode = ChangeDetectionSupport.resolveMode(ctx.changeMode(), ctx.nativeHashFile());
-					nativeChanged
-							.addAll(me.bechberger.testorder.changes.NativeChangeDetector.detect(mode, ctx.projectRoot(),
+					nativeChanged.addAll(
+							me.bechberger.testorder.changes.NativeChangeDetector.detect(mode, ctx.nativeProjectRoot(),
 									ctx.nativeRoots(), ctx.nativeHashFile(), null, true, sharedRepoSnapshot));
 				} catch (IOException e) {
 					ctx.log().warn("[test-order] Native change detection failed: " + e.getMessage()

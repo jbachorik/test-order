@@ -53,13 +53,26 @@ public class FileHashStore {
 		return new FileHashStore(hashes);
 	}
 
-	/**
-	 * Package-visible so {@link NativeChangeDetector} hashes native files
-	 * identically.
-	 */
+	/** Package-visible Java/Kotlin source hashing with a safe I/O fallback. */
 	static String sha256Safe(Path file) {
 		try {
 			return sha256(file);
+		} catch (IOException e) {
+			return "";
+		}
+	}
+
+	/** Hashes native source bytes verbatim without applying the Java normalizer. */
+	static String sha256RawSafe(Path file) {
+		try (InputStream input = Files.newInputStream(file)) {
+			MessageDigest digest = SHA256.get();
+			digest.reset();
+			byte[] buffer = new byte[8192];
+			int read;
+			while ((read = input.read(buffer)) != -1) {
+				digest.update(buffer, 0, read);
+			}
+			return HEX_FORMAT.formatHex(digest.digest());
 		} catch (IOException e) {
 			return "";
 		}
@@ -137,10 +150,7 @@ public class FileHashStore {
 		}
 	});
 
-	/**
-	 * Package-visible so {@link NativeChangeDetector} hashes native files
-	 * identically.
-	 */
+	/** Hashes Java/Kotlin source using the existing source-content normalizer. */
 	static String sha256(Path file) throws IOException {
 		// Normalize source content so that comment-only and whitespace-only changes
 		// do not produce different hashes. String literal changes are still detected.

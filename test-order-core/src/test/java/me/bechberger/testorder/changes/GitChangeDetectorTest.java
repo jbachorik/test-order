@@ -29,7 +29,7 @@ class GitChangeDetectorTest {
 		// helpers) that hold file locks and cause @TempDir cleanup failures on CI.
 		pb.environment().put("GIT_CONFIG_NOSYSTEM", "1");
 		pb.environment().put("GIT_TERMINAL_PROMPT", "0");
-		pb.environment().put("GIT_CONFIG_COUNT", "5");
+		pb.environment().put("GIT_CONFIG_COUNT", "6");
 		pb.environment().put("GIT_CONFIG_KEY_0", "gc.auto");
 		pb.environment().put("GIT_CONFIG_VALUE_0", "0");
 		pb.environment().put("GIT_CONFIG_KEY_1", "core.fsmonitor");
@@ -40,6 +40,8 @@ class GitChangeDetectorTest {
 		pb.environment().put("GIT_CONFIG_VALUE_3", "0");
 		pb.environment().put("GIT_CONFIG_KEY_4", "credential.helper");
 		pb.environment().put("GIT_CONFIG_VALUE_4", "");
+		pb.environment().put("GIT_CONFIG_KEY_5", "commit.gpgsign");
+		pb.environment().put("GIT_CONFIG_VALUE_5", "false");
 		pb.redirectErrorStream(true);
 		Process p = pb.start();
 		p.getInputStream().readAllBytes(); // consume output

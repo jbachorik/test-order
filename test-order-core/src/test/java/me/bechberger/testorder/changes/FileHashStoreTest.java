@@ -33,6 +33,26 @@ class FileHashStoreTest {
 	}
 
 	@Test
+	void rawNativeHashIncludesCommentsAndWhitespace() throws IOException {
+		Path nativeFile = tempDir.resolve("source.cpp");
+		Files.writeString(nativeFile, "int value; // a");
+		String first = FileHashStore.sha256RawSafe(nativeFile);
+		Files.writeString(nativeFile, "int value; // b");
+		String second = FileHashStore.sha256RawSafe(nativeFile);
+		assertNotEquals(first, second, "native hashing must preserve raw C/C++ source bytes");
+	}
+
+	@Test
+	void javaHashPathStillNormalizesComments() throws IOException {
+		Path source = tempDir.resolve("JavaSource.java");
+		Files.writeString(source, "class JavaSource {} // first");
+		String first = FileHashStore.sha256Safe(source);
+		Files.writeString(source, "class JavaSource {} // second");
+		String second = FileHashStore.sha256Safe(source);
+		assertEquals(first, second, "the Java/Kotlin hash path must retain its source normalizer");
+	}
+
+	@Test
 	void detectChangedFile() throws IOException {
 		Path srcRoot = tempDir.resolve("src");
 		Files.createDirectories(srcRoot.resolve("com/example"));

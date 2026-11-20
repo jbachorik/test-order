@@ -1,8 +1,10 @@
 package me.bechberger.testorder.nativecov;
 
+import java.io.BufferedReader;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.stream.Stream;
@@ -38,6 +40,9 @@ import me.bechberger.util.json.Util;
  * files or not under a declared native source root are dropped with a warning.
  */
 public final class NativeCoverageParser {
+
+	private static final long DEFAULT_MAX_ARTIFACT_BYTES = 5_000_000L;
+	private static final String MAX_ARTIFACT_BYTES_PROPERTY = "testorder.native.maxArtifactBytes";
 
 	private NativeCoverageParser() {
 	}
@@ -76,8 +81,10 @@ public final class NativeCoverageParser {
 			}
 			Path abs = root.toAbsolutePath().normalize();
 			String key = NativeChangeDetector.nativeKey(projectRoot, abs);
-			// Directory key — normalize to a prefix with trailing slash semantics
-			rootPrefixes.add(key.endsWith("/") ? key : key + "/");
+			// Directory key — normalize to a prefix with trailing slash semantics.
+			// The empty key represents the project root and must match relative keys
+			// without introducing a leading slash.
+			rootPrefixes.add(key.isEmpty() || key.endsWith("/") ? key : key + "/");
 		}
 
 		Map<String, Set<String>> testToFiles = new TreeMap<>();
@@ -95,8 +102,15 @@ public final class NativeCoverageParser {
 			return new Result(Map.of(), 0, warnings);
 		}
 
+		long maxArtifactBytes = maxArtifactBytes();
 		for (Path artifact : artifacts) {
 			try {
+				long artifactBytes = Files.size(artifact);
+				if (artifactBytes > maxArtifactBytes) {
+					warnings.add("Coverage artifact " + artifact.getFileName() + " exceeds the " + maxArtifactBytes
+							+ " byte limit — skipped entirely");
+					continue;
+				}
 				String name = artifact.getFileName().toString().toLowerCase(Locale.ROOT);
 				if (name.endsWith(".jsonl")) {
 					parseJsonl(artifact, projectRoot, rootPrefixes, testToFiles, warnings, parsed);
@@ -138,7 +152,7 @@ public final class NativeCoverageParser {
 			int before = testToFiles.getOrDefault(test, Set.of()).size();
 			for (Object entry : Util.asList(map.get("files"))) {
 				Map<String, Object> entryMap = Util.asMap(entry);
-				if (entryMap == null) {
+				if (entryMap == null || !hasCoveredGcovrLines(entryMap)) {
 					continue;
 				}
 				addCoveredFile(test, strOrNull(entryMap.get("file")), projectRoot, rootPrefixes, testToFiles, warnings,
@@ -157,7 +171,9 @@ public final class NativeCoverageParser {
 			return;
 		}
 		int before = testToFiles.getOrDefault(test, Set.of()).size();
-		for (Object file : Util.asList(map.get("coveredFiles"))) {
+		Object filesObj = map.get("coveredFiles");
+		List<Object> files = filesObj == null ? List.of() : Util.asList(filesObj);
+		for (Object file : files) {
 			addCoveredFile(test, file instanceof String s ? s : null, projectRoot, rootPrefixes, testToFiles, warnings,
 					artifact);
 		}
@@ -167,33 +183,42 @@ public final class NativeCoverageParser {
 
 	private static void parseJsonl(Path artifact, Path projectRoot, Set<String> rootPrefixes,
 			Map<String, Set<String>> testToFiles, List<String> warnings, int[] parsed) throws IOException {
-		List<String> lines = Files.readAllLines(artifact, StandardCharsets.UTF_8);
-		for (int i = 0; i < lines.size(); i++) {
-			String line = lines.get(i).trim();
-			if (line.isEmpty()) {
-				continue;
+		boolean acceptedRecord = false;
+		int lineNumber = 0;
+		try (BufferedReader reader = Files.newBufferedReader(artifact, StandardCharsets.UTF_8)) {
+			String rawLine;
+			while ((rawLine = reader.readLine()) != null) {
+				lineNumber++;
+				String line = rawLine.trim();
+				if (line.isEmpty()) {
+					continue;
+				}
+				Map<String, Object> map;
+				try {
+					map = Util.asMap(JSONParser.parse(line));
+				} catch (IOException | me.bechberger.util.json.JSONParseException e) {
+					warnings.add(artifact.getFileName() + " line " + lineNumber + ": invalid JSON — skipped");
+					continue;
+				}
+				if (map == null) {
+					warnings.add(artifact.getFileName() + " line " + lineNumber + ": not a JSON object — skipped");
+					continue;
+				}
+				String test = strOrNull(map.get("test"));
+				if (test == null) {
+					warnings.add(artifact.getFileName() + " line " + lineNumber + ": missing 'test' field — skipped");
+					continue;
+				}
+				acceptedRecord = true;
+				Object filesObj = map.get("coveredFiles");
+				List<Object> files = filesObj == null ? List.of() : Util.asList(filesObj);
+				for (Object file : files) {
+					addCoveredFile(test, file instanceof String s ? s : null, projectRoot, rootPrefixes, testToFiles,
+							warnings, artifact);
+				}
 			}
-			Map<String, Object> map;
-			try {
-				map = Util.asMap(JSONParser.parse(line));
-			} catch (IOException | me.bechberger.util.json.JSONParseException e) {
-				warnings.add(artifact.getFileName() + " line " + (i + 1) + ": invalid JSON — skipped");
-				continue;
-			}
-			if (map == null) {
-				warnings.add(artifact.getFileName() + " line " + (i + 1) + ": not a JSON object — skipped");
-				continue;
-			}
-			String test = strOrNull(map.get("test"));
-			if (test == null) {
-				warnings.add(artifact.getFileName() + " line " + (i + 1) + ": missing 'test' field — skipped");
-				continue;
-			}
-			int before = testToFiles.getOrDefault(test, Set.of()).size();
-			for (Object file : Util.asList(map.get("coveredFiles"))) {
-				addCoveredFile(test, file instanceof String s ? s : null, projectRoot, rootPrefixes, testToFiles,
-						warnings, artifact);
-			}
+		}
+		if (acceptedRecord) {
 			parsed[0]++;
 		}
 	}
@@ -203,23 +228,71 @@ public final class NativeCoverageParser {
 		if (covered == null || covered.isBlank()) {
 			return;
 		}
-		Path resolved = Path.of(covered);
-		if (!resolved.isAbsolute()) {
-			resolved = projectRoot.resolve(resolved);
+		Path resolved;
+		try {
+			resolved = Path.of(covered);
+			if (!resolved.isAbsolute()) {
+				resolved = projectRoot.resolve(resolved);
+			}
+			resolved = resolved.toAbsolutePath().normalize();
+		} catch (InvalidPathException e) {
+			warnings.add(
+					"Coverage artifact " + artifact.getFileName() + " contains invalid path " + covered + " — dropped");
+			return;
 		}
-		resolved = resolved.toAbsolutePath().normalize();
 		if (!NativeChangeDetector.isNativeSourceFile(resolved.toString())) {
 			warnings.add("Covered file " + covered + " (test " + test + ") is not a native source file — dropped");
 			return;
 		}
 		String key = NativeChangeDetector.nativeKey(projectRoot, resolved);
-		boolean underRoot = rootPrefixes.stream().anyMatch(key::startsWith);
+		boolean underRoot = !isAbsoluteNativeKey(key)
+				&& rootPrefixes.stream().anyMatch(prefix -> prefix.isEmpty() || key.startsWith(prefix));
 		if (!underRoot) {
 			warnings.add("Covered file " + key + " (test " + test
 					+ ") is outside the declared native source roots — dropped");
 			return;
 		}
 		testToFiles.computeIfAbsent(test, k -> new TreeSet<>()).add(key);
+	}
+
+	private static boolean hasCoveredGcovrLines(Map<String, Object> entry) {
+		Object lineRate = entry.get("line_rate");
+		if (lineRate instanceof Number rate && rate.doubleValue() == 0.0d) {
+			return false;
+		}
+		List<Object> lines = Util.asList(entry.get("lines"));
+		if (lines == null) {
+			return false;
+		}
+		for (Object line : lines) {
+			Map<String, Object> lineMap = Util.asMap(line);
+			Object count = lineMap == null ? null : lineMap.get("count");
+			if (count instanceof Number covered && covered.doubleValue() > 0.0d) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static boolean isAbsoluteNativeKey(String key) {
+		return key.startsWith("/") || key.matches("^[A-Za-z]:/.*");
+	}
+
+	/**
+	 * Maximum artifact size in bytes. Override with
+	 * {@code testorder.native.maxArtifactBytes}.
+	 */
+	private static long maxArtifactBytes() {
+		String configured = System.getProperty(MAX_ARTIFACT_BYTES_PROPERTY);
+		if (configured == null) {
+			return DEFAULT_MAX_ARTIFACT_BYTES;
+		}
+		try {
+			long limit = Long.parseLong(configured);
+			return limit >= 0 ? limit : DEFAULT_MAX_ARTIFACT_BYTES;
+		} catch (NumberFormatException e) {
+			return DEFAULT_MAX_ARTIFACT_BYTES;
+		}
 	}
 
 	private static void logArtifact(String test, int files, Path artifact) {

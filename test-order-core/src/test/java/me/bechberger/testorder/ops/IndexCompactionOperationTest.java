@@ -1,11 +1,15 @@
 package me.bechberger.testorder.ops;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import org.junit.jupiter.api.Test;
@@ -37,6 +41,51 @@ class IndexCompactionOperationTest {
 		DependencyMap map = DependencyMap.load(indexFile);
 		assertEquals(Set.of("com.example.Foo", "com.example.Bar"), map.get("com.example.FooTest"));
 		assertEquals(Set.of("com.example.Bar"), map.get("com.example.BarTest"));
+	}
+
+	@Test
+	void preservesExplicitNativeEdgesAcrossRepeatedCompactionAndRejectsUnmarkedOrAbsolutePaths() throws IOException {
+		Path depsDir = tempDir.resolve("deps");
+		Files.createDirectories(depsDir);
+		Files.writeString(depsDir.resolve("com.example.FooTest.deps"), "com.example.New\n");
+		Path indexFile = tempDir.resolve("test-order.idx");
+
+		DependencyMap oldMap = new DependencyMap();
+		oldMap.put("com.example.FooTest",
+				Set.of("com.example.Old", "src/native.cpp", "legacy/path.cpp", "/tmp/machine/native.cpp"));
+		oldMap = oldMap.withNativeAugmentation(
+				Map.of("com.example.FooTest", Set.of("src/native.cpp", "/tmp/machine/native.cpp")));
+		oldMap.save(indexFile);
+
+		List<String> warnings = new ArrayList<>();
+		PluginLog log = new PluginLog() {
+			@Override
+			public void info(String message) {
+			}
+
+			@Override
+			public void warn(String message) {
+				warnings.add(message);
+			}
+
+			@Override
+			public void debug(String message) {
+			}
+		};
+
+		IndexCompactionOperation.compact(depsDir, indexFile, log);
+		DependencyMap first = DependencyMap.load(indexFile);
+		assertEquals(Set.of("com.example.New", "src/native.cpp"), first.get("com.example.FooTest"));
+		assertTrue(first.isNativeUnit("src/native.cpp"));
+		assertFalse(first.get("com.example.FooTest").contains("legacy/path.cpp"));
+		assertFalse(first.get("com.example.FooTest").contains("/tmp/machine/native.cpp"));
+		assertTrue(warnings.stream().anyMatch(message -> message.contains("absolute native unit key")));
+		assertTrue(warnings.stream().anyMatch(message -> message.contains("unmarked path-like")));
+
+		IndexCompactionOperation.compact(depsDir, indexFile, log);
+		DependencyMap second = DependencyMap.load(indexFile);
+		assertTrue(second.get("com.example.FooTest").contains("src/native.cpp"));
+		assertTrue(second.isNativeUnit("src/native.cpp"));
 	}
 
 	@Test

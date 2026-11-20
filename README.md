@@ -246,6 +246,26 @@ Configure via `-Dtestorder.changeMode=<mode>`:
 </details>
 
 <details>
+<summary><strong>Native C/C++ coverage in Gradle</strong></summary>
+
+Configure native sources and per-test coverage artifacts in the Gradle project that owns them:
+
+```groovy
+testOrder {
+    nativeTests {
+        sourceRoots = files("src/profiling")
+        coverageDir = layout.buildDirectory.dir("native-coverage")
+    }
+}
+```
+
+Relative `sourceRoots`, `coverageDir`, and covered-file paths inside coverage artifacts are resolved against the project declaring `nativeTests`. Native unit keys use that same project's directory as their base. Source roots outside the declaring project's directory are ignored with a warning; move the sources under the project or declare `nativeTests` in the project that owns them. A source root equal to the project directory is allowed but emits a warning because it includes all native files below that directory.
+
+When multiple subprojects share an index, their project-relative native keys can collide. This can select extra tests, but does not cause tests to be missed.
+
+</details>
+
+<details>
 <summary><strong>Affected-test selection (coverage closure)</strong></summary>
 
 `mvn test-order:affected test` / `./gradlew testOrderAffected` (and the tier-1 / `auto` selection paths) guarantee that the selected subset exercises every changed class/method that at least one indexed test can exercise:

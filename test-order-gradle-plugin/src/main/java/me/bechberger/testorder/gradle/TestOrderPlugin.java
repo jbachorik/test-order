@@ -2993,6 +2993,7 @@ public class TestOrderPlugin implements Plugin<Project> {
 
         return PluginContext.builder()
                 .projectRoot(project.getRootProject().getProjectDir().toPath().toAbsolutePath())
+                .nativeProjectRoot(project.getProjectDir().toPath().toAbsolutePath().normalize())
                 .repoRoot(project.getRootProject().getProjectDir().toPath().toAbsolutePath())
                 .sourceRoot(sourceRoot)
                 .testSourceRoot(testSourceRoot)
@@ -3400,7 +3401,7 @@ public class TestOrderPlugin implements Plugin<Project> {
         if (!nativeRoots.isEmpty()) {
             try {
                 me.bechberger.testorder.changes.NativeChangeDetector.snapshot(
-                        project.getRootProject().getProjectDir().toPath().toAbsolutePath(),
+                        project.getProjectDir().toPath().toAbsolutePath().normalize(),
                         nativeRoots,
                         ext.getNativeHashFile().get().getAsFile().toPath());
             } catch (IOException e) {
@@ -3411,42 +3412,73 @@ public class TestOrderPlugin implements Plugin<Project> {
 
     /**
      * Declared native source roots, resolved against the project directory.
-     * Empty when {@code nativeTests} is absent or has no sourceRoots — native
-     * support is active only when configured.
+     * Roots outside that directory are ignored because native unit keys are
+     * project-relative. Empty when {@code nativeTests} is absent or has no roots.
      */
     static List<Path> resolveNativeRoots(Project project, TestOrderExtension ext) {
         TestOrderExtension.NativeTests nt = ext.getNativeTests();
         if (nt == null) {
             return List.of();
         }
+        Path nativeProjectRoot = project.getProjectDir().toPath().toAbsolutePath().normalize();
         List<Path> roots = new ArrayList<>();
         for (File f : nt.getSourceRoots()) {
-            Path p = f.toPath();
-            if (!p.isAbsolute()) {
-                p = project.getProjectDir().toPath().resolve(p);
+            Path root = f.toPath();
+            if (!root.isAbsolute()) {
+                root = nativeProjectRoot.resolve(root);
             }
-            roots.add(p.toAbsolutePath().normalize());
+            root = root.toAbsolutePath().normalize();
+            if (!root.startsWith(nativeProjectRoot)) {
+                project.getLogger().warn(
+                        "[test-order] Native sourceRoot {} in project {} is outside the project directory {} "
+                                + "and is ignored; native unit keys are project-relative — move it under {} or "
+                                + "declare nativeTests in the project that owns it",
+                        root, project.getPath(), nativeProjectRoot, nativeProjectRoot);
+                continue;
+            }
+            if (root.equals(nativeProjectRoot)) {
+                project.getLogger().warn(
+                        "[test-order] Native sourceRoot {} is the project directory for {}; all native source "
+                                + "files under that directory may be considered",
+                        root, project.getPath());
+            }
+            roots.add(root);
         }
         return roots;
     }
 
     /** Coverage directory declared for native collect, or null when not set. */
-    static Path resolveNativeCoverageDir(TestOrderExtension ext) {
+    static Path resolveNativeCoverageDir(Project project, TestOrderExtension ext) {
         TestOrderExtension.NativeTests nt = ext.getNativeTests();
         if (nt == null) {
             return null;
         }
         java.io.File dir = nt.getCoverageDir().getAsFile().getOrNull();
-        return dir != null ? dir.toPath() : null;
+        if (dir == null) {
+            return null;
+        }
+        Path coverageDir = dir.toPath();
+        if (!coverageDir.isAbsolute()) {
+            coverageDir = project.getProjectDir().toPath().resolve(coverageDir);
+        }
+        return coverageDir.toAbsolutePath().normalize();
     }
 
     private static void runNativeCollect(Project project, TestOrderExtension ext) {
         List<Path> nativeRoots = resolveNativeRoots(project, ext);
         if (nativeRoots.isEmpty()) {
+            TestOrderExtension.NativeTests nativeTests = ext.getNativeTests();
+            if (nativeTests != null && !nativeTests.getSourceRoots().isEmpty()) {
+                project.getLogger().warn(
+                        "[test-order] No native source roots remain inside project directory {}; skipping native "
+                                + "collection",
+                        project.getProjectDir().toPath().toAbsolutePath().normalize());
+                return;
+            }
             throw new GradleException("[test-order] testOrderNativeCollect requires native source roots:\n"
                     + "testOrder { nativeTests { sourceRoots = files(\"src/<native-dir>\") } }");
         }
-        Path coverageDir = resolveNativeCoverageDir(ext);
+        Path coverageDir = resolveNativeCoverageDir(project, ext);
         if (coverageDir == null) {
             project.getLogger().warn("[test-order] nativeTests.coverageDir is not set — skipping coverage "
                     + "artifact parsing, performing only the JNI cross-check");
@@ -3454,7 +3486,7 @@ public class TestOrderPlugin implements Plugin<Project> {
             project.getLogger().warn("[test-order] nativeTests.coverageDir {} does not exist — skipping "
                     + "coverage artifact parsing, performing only the JNI cross-check", coverageDir);
         }
-        Path projectRoot = project.getRootProject().getProjectDir().toPath().toAbsolutePath();
+        Path projectRoot = project.getProjectDir().toPath().toAbsolutePath().normalize();
         Path indexFile = ext.getIndexFile().get().getAsFile().toPath();
         try {
             me.bechberger.testorder.ops.NativeCollectOperation.Result result =
