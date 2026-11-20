@@ -4,6 +4,7 @@ import static org.gradle.testkit.runner.TaskOutcome.FAILED;
 import static org.gradle.testkit.runner.TaskOutcome.SUCCESS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -21,6 +22,7 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import me.bechberger.testorder.DependencyMap;
+import me.bechberger.testorder.changes.NativeChangeDetector;
 
 /**
  * Integration tests for the native (C/C++) support: {@code nativeTests} DSL,
@@ -45,7 +47,7 @@ class NativeCollectIntegrationTest {
                 """);
         writeFile("build.gradle", """
                 plugins {
-                    id 'me.bechberger.test-order' version '0.1.1'
+                    id 'me.bechberger.test-order'
                 }
                 testOrder {
                     nativeTests {
@@ -83,6 +85,7 @@ class NativeCollectIntegrationTest {
         return GradleRunner.create()
                 .withGradleVersion("9.9.1")
                 .withProjectDir(projectDir.toFile())
+                .withPluginClasspath()
                 .withArguments(args)
                 .forwardOutput();
     }
@@ -102,6 +105,75 @@ class NativeCollectIntegrationTest {
         // cross-check edge for FooTest: member dep com.example.Foo#run is exported from foo.cpp
         assertTrue(after.get("com.example.FooTest").contains("src/profiling/foo.cpp"));
         assertTrue(after.get("com.example.FooTest").contains("com.example.Foo"));
+    }
+
+    @Test
+    @DisplayName("subproject native paths and relative coverage artifacts use the declaring project base")
+    void subprojectNativeCollectionUsesDeclaringProjectRelativeKeys() throws IOException {
+        writeFile("settings.gradle", """
+                pluginManagement {
+                    repositories {
+                        mavenLocal()
+                        gradlePluginPortal()
+                        mavenCentral()
+                    }
+                }
+                rootProject.name = 'multi-native-project'
+                include 'native-module'
+                """);
+        writeFile("build.gradle", "");
+        writeFile("native-module/build.gradle", """
+                plugins {
+                    id 'me.bechberger.test-order'
+                }
+                testOrder {
+                    nativeTests {
+                        sourceRoots = files('.', '../outside-native', 'src/profiling')
+                        coverageDir = layout.projectDirectory.dir('build/native-coverage')
+                    }
+                }
+                """);
+        writeFile("native-module/src/profiling/foo.cpp", """
+                #include <jni.h>
+                JNIEXPORT void JNICALL Java_com_example_Native_run(JNIEnv* env, jobject obj) {}
+                """);
+        writeFile("outside-native/outside.cpp", """
+                #include <jni.h>
+                JNIEXPORT void JNICALL Java_com_example_Outside_run(JNIEnv* env, jobject obj) {}
+                """);
+        writeFile("native-module/build/native-coverage/com.example.CoverageTest.json", """
+                {"test": "com.example.CoverageTest", "coveredFiles": ["src/profiling/foo.cpp"]}
+                """);
+
+        DependencyMap map = new DependencyMap();
+        map.put("com.example.JniTest", Set.of("com.example.Native"));
+        map.putMemberDeps("com.example.JniTest", Set.of("com.example.Native#run"));
+        map.put("com.example.OutsideJniTest", Set.of("com.example.Outside"));
+        map.putMemberDeps("com.example.OutsideJniTest", Set.of("com.example.Outside#run"));
+        Path indexFile = projectDir.resolve(".test-order/test-dependencies.lz4");
+        Files.createDirectories(indexFile.getParent());
+        map.save(indexFile);
+
+        BuildResult result = runner(":native-module:testOrderNativeCollect").build();
+        assertEquals(SUCCESS, result.task(":native-module:testOrderNativeCollect").getOutcome());
+
+        DependencyMap after = DependencyMap.load(indexFile);
+        assertTrue(after.get("com.example.CoverageTest").contains("src/profiling/foo.cpp"),
+                "relative artifact path and source root should resolve from native-module");
+        assertTrue(after.get("com.example.JniTest").contains("src/profiling/foo.cpp"),
+                "native unit keys should be relative to the project declaring nativeTests");
+        assertTrue(after.get("com.example.JniTest").stream().noneMatch(path -> path.startsWith("native-module/")),
+                "root-project-relative native keys must not leak into the index");
+        assertTrue(after.get("com.example.OutsideJniTest").stream().noneMatch(path -> path.contains("outside-native")),
+                "source roots outside the declaring project must not create native edges");
+        assertTrue(result.getOutput().contains("outside-native"),
+                "rejected source roots should be reported with a warning");
+        Path moduleRoot = projectDir.resolve("native-module");
+        assertTrue(result.getOutput().contains(moduleRoot.toString()),
+                "a source root equal to the declaring project base should be accepted with a warning");
+        assertEquals(Set.of("src/profiling/foo.cpp"), NativeChangeDetector
+                .scanNativeRoots(moduleRoot, java.util.List.of(moduleRoot.resolve("src/profiling"))).keySet(),
+                "native hash snapshot keys should use the same declaring-project-relative base");
     }
 
     @Test
@@ -130,9 +202,57 @@ class NativeCollectIntegrationTest {
     private void writeRichBuildGradleWithoutNativeTests() throws IOException {
         writeFile("build.gradle", """
                 plugins {
-                    id 'me.bechberger.test-order' version '0.1.1'
+                    id 'me.bechberger.test-order'
                 }
                 """);
+    }
+
+    @Test
+    @DisplayName("plain nativeTests wiring schedules no native build tasks for testOrderNativeCollect")
+    void plainWiringAddsNoTaskDependencies() throws IOException {
+        scaffoldNativeProject();
+
+        BuildResult result = runner("testOrderNativeCollect", "--quiet").build();
+        assertEquals(SUCCESS, result.task(":testOrderNativeCollect").getOutcome());
+        // the only scheduled tasks are the requested one and Gradle lifecycle helpers;
+        // no native build task exists in the fixture, so none may appear in the graph
+        for (String taskPath : result.getTasks().stream().map(t -> t.getPath()).toList()) {
+            assertTrue(taskPath.equals(":testOrderNativeCollect") || taskPath.startsWith(":help")
+                    || taskPath.endsWith("TestOrderNativeCollect") && taskPath.startsWith(":")
+                            && !taskPath.equals(":nativeBuild") && !taskPath.contains("compile")
+                            && !taskPath.contains("link"),
+                    "unexpected task in graph: " + taskPath);
+        }
+    }
+
+    @Test
+    @DisplayName("builtBy-carried sourceRoots do not drag producer tasks into the collect task graph")
+    void builtBySourceRootsDoNotDragProducersIntoGraph() throws IOException {
+        scaffoldNativeProject();
+        // Mirrors a consumer wiring where the source-roots file collection carries
+        // builtBy producer tasks (the only Gradle mechanism that could pull native
+        // build tasks like :ddprof-test-native:compileLib/:linkLib into a collect run).
+        writeFile("build.gradle", """
+                plugins {
+                    id 'me.bechberger.test-order'
+                }
+                tasks.register('makeNativeLib') {
+                    doLast { } // pretend native build
+                }
+                testOrder {
+                    nativeTests {
+                        sourceRoots = files('src/profiling') { builtBy 'makeNativeLib' }
+                        coverageDir = layout.projectDirectory.dir('build/native-coverage')
+                    }
+                }
+                """);
+
+        BuildResult result = runner("testOrderNativeCollect", "--quiet").build();
+        assertEquals(SUCCESS, result.task(":testOrderNativeCollect").getOutcome());
+        assertNull(result.task(":makeNativeLib"),
+                "builtBy on nativeTests.sourceRoots must not drag the producer task into the "
+                        + "testOrderNativeCollect graph — if this fails, the plugin has an input "
+                        + "or dependsOn leak");
     }
 
     @Test

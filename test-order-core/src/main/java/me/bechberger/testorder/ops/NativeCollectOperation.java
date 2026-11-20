@@ -25,10 +25,14 @@ import me.bechberger.testorder.nativecov.NativeCoverageParser;
  * <li>Scans the declared native source roots for JNI exports
  * ({@link JniExportScanner}) and intersects them with the index's MEMBER-mode
  * member dependencies: a test whose tracked members include a JNI-exported
- * {@code FQCN#method} gains an edge to the source file exporting it. This is
- * the Java↔native cross-check — it makes C++ changes select the Java tests
- * whose profiles exercise the changed native entry points even without gcov
- * data.</li>
+ * {@code FQCN#method} gains an edge to the source file exporting it. When no
+ * exact member matches (the common wrapper pattern: tests call
+ * {@code Wrapper#method} while the native impl exports
+ * {@code Wrapper#method0}), the fallback matches on the export's <b>class</b>
+ * part — any member-level dependency on a class with JNI exports gains an edge
+ * to the files exporting that class. This is the Java↔native cross-check — it
+ * makes C++ changes select the Java tests whose profiles exercise the changed
+ * native entry points even without gcov data.</li>
  * <li>Merges all edges into the binary index under a file lock. Native units
  * are plain path-keyed deps (v2 index), so scoring and closure need no change.
  * </li>
@@ -48,10 +52,6 @@ public final class NativeCollectOperation {
 	/** Statistics from one collect run. */
 	public record Result(int artifactsParsed, int testsWithGcovEdges, int gcovEdgeCount, int jniExportCount,
 			int crossCheckTests, int crossCheckEdgeCount, int totalTestsMerged, List<String> warnings) {
-
-		public boolean hasEdges() {
-			return gcovEdgeCount > 0 || crossCheckEdgeCount > 0;
-		}
 	}
 
 	/**
@@ -89,46 +89,32 @@ public final class NativeCollectOperation {
 			}
 		}
 
-		// 3. Cross-check: member deps ∩ JNI exports → test → native file edges
-		Map<String, Set<String>> edges = new TreeMap<>();
-		int crossCheckTests = 0;
-		int crossCheckEdges = 0;
-		int jniExportCount = exportToFiles.size();
-		if (!exportToFiles.isEmpty()) {
-			DependencyMap index = DependencyMap.load(indexFile);
-			if (index.hasMemberDeps()) {
-				Map<String, Set<String>> crossCheck = crossCheckMemberDeps(index, exportToFiles);
-				for (Map.Entry<String, Set<String>> e : crossCheck.entrySet()) {
-					edges.put(e.getKey(), e.getValue());
-					crossCheckTests++;
-					crossCheckEdges += e.getValue().size();
-				}
-			}
-		}
+		// 3. Gcov edges are filtered before the native-aware locked merge so absolute
+		// machine-specific paths are never persisted.
+		Map<String, Set<String>> gcovEdgesByTest = filterAbsoluteNativeKeys(parsed.testToFiles(), warnings);
+		int gcovTests = gcovEdgesByTest.size();
+		int gcovEdges = gcovEdgesByTest.values().stream().mapToInt(Set::size).sum();
+		int jniExportCount = fileToExports.values().stream().mapToInt(Set::size).sum();
 
-		// 4. Merge gcov edges + cross-check edges into the index (file-locked)
-		int gcovTests = 0;
-		int gcovEdges = 0;
-		for (Map.Entry<String, Set<String>> e : parsed.testToFiles().entrySet()) {
-			Set<String> merged = edges.computeIfAbsent(e.getKey(), k -> new TreeSet<>());
-			merged.addAll(e.getValue());
-			gcovTests++;
-			gcovEdges += e.getValue().size();
-		}
-
-		int totalTests = 0;
-		if (!edges.isEmpty()) {
-			Map<String, Set<String>> unmodifiable = new TreeMap<>();
-			edges.forEach((k, v) -> unmodifiable.put(k, Collections.unmodifiableSet(v)));
-			DependencyMap.mergeFromAgent(indexFile, unmodifiable, Map.of(), Map.of(), Map.of());
-			totalTests = unmodifiable.size();
-		}
-
+		// 4. Derive JNI/member edges from the same index instance that is merged,
+		// under one file lock and one deserialization.
+		Map<String, Set<String>> crossCheck = DependencyMap.mergeFromAgentWithDerivedDeps(indexFile, gcovEdgesByTest,
+				index -> {
+					if (!index.hasMemberDeps() || exportToFiles.isEmpty()) {
+						return Map.of();
+					}
+					return filterAbsoluteNativeKeys(crossCheckMemberDeps(index, exportToFiles), warnings);
+				});
+		int crossCheckTests = crossCheck.size();
+		int crossCheckEdges = crossCheck.values().stream().mapToInt(Set::size).sum();
+		Set<String> mergedTests = new java.util.HashSet<>(gcovEdgesByTest.keySet());
+		mergedTests.addAll(crossCheck.keySet());
+		int totalTests = mergedTests.size();
 		log.info("[test-order] Native collect: parsed " + parsed.artifactsParsed() + " artifact(s), " + gcovTests
 				+ " test(s) with " + gcovEdges + " gcov edge(s), " + jniExportCount
 				+ " JNI export(s), cross-check added " + crossCheckEdges + " edge(s) for " + crossCheckTests
 				+ " test(s)");
-		if (!parsed.testToFiles().isEmpty() || !edges.isEmpty()) {
+		if (!gcovEdgesByTest.isEmpty() || !crossCheck.isEmpty()) {
 			log.info("[test-order] Native collect: merged native edges for " + totalTests + " test class(es) into "
 					+ indexFile.getFileName());
 		}
@@ -149,14 +135,39 @@ public final class NativeCollectOperation {
 			classToMemberDeps.computeIfAbsent(methodClass(methodKey), k -> new TreeSet<>())
 					.addAll(index.getMethodMemberDeps(methodKey));
 		}
+		// Class-level fallback: MEMBER-mode deps record the public wrappers tests call
+		// (e.g. JavaProfiler#blockEnter) while JNI exports are the *0 native impls
+		// (JavaProfiler#blockEnter0) — the exact member-key intersection is empty by
+		// construction on wrapper-style JNI codebases. Fall back to the export's CLASS
+		// part: any member-level dependency on a class with JNI exports gains an edge
+		// to the files exporting that class. This may over-select (a test touching an
+		// unrelated member of the wrapper class) but never under-select.
+		Map<String, Set<String>> exportsByClass = new HashMap<>();
+		for (Map.Entry<String, Set<String>> e : exportToFiles.entrySet()) {
+			exportsByClass.computeIfAbsent(methodClass(e.getKey()), k -> new TreeSet<>()).addAll(e.getValue());
+		}
 
 		Map<String, Set<String>> edges = new TreeMap<>();
 		for (String test : index.testClasses()) {
 			Set<String> memberKeys = new TreeSet<>(index.getMemberDeps(test));
 			memberKeys.addAll(classToMemberDeps.getOrDefault(test, Set.of()));
+			Set<String> classes = new TreeSet<>();
 			Set<String> files = null;
 			for (String memberKey : memberKeys) {
+				classes.add(methodClass(memberKey));
 				Set<String> exported = exportToFiles.get(memberKey);
+				if (exported != null) {
+					if (files == null) {
+						files = new TreeSet<>();
+					}
+					files.addAll(exported);
+				}
+			}
+			// Class-level fallback unions every file exporting the class — an exact
+			// member key alone would leave sibling native impl files of the same
+			// class unselected.
+			for (String clazz : classes) {
+				Set<String> exported = exportsByClass.get(clazz);
 				if (exported != null) {
 					if (files == null) {
 						files = new TreeSet<>();
@@ -169,6 +180,29 @@ public final class NativeCollectOperation {
 			}
 		}
 		return edges;
+	}
+
+	private static Map<String, Set<String>> filterAbsoluteNativeKeys(Map<String, Set<String>> source,
+			List<String> warnings) {
+		Map<String, Set<String>> filtered = new TreeMap<>();
+		for (Map.Entry<String, Set<String>> entry : source.entrySet()) {
+			Set<String> paths = new TreeSet<>();
+			for (String path : entry.getValue()) {
+				if (isAbsoluteNativeKey(path)) {
+					warnings.add("Ignoring absolute native unit key '" + path + "'");
+				} else {
+					paths.add(path);
+				}
+			}
+			if (!paths.isEmpty()) {
+				filtered.put(entry.getKey(), Collections.unmodifiableSet(paths));
+			}
+		}
+		return filtered;
+	}
+
+	private static boolean isAbsoluteNativeKey(String key) {
+		return key.startsWith("/") || key.matches("^[A-Za-z]:/.*");
 	}
 
 	/** Class part of a {@code className#methodName} method key. */

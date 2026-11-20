@@ -100,6 +100,24 @@ class NativeCollectOperationTest {
 	}
 
 	@Test
+	void duplicateJniExportsInSeparateFilesAreCountedPerFileAndKeepBothEdges() throws IOException {
+		setup();
+		writeIndex();
+		String export = "JNIEXPORT void JNICALL Java_com_example_Foo_run(JNIEnv*, jobject) {}";
+		writeNativeFile("src/profiling/first.cpp", export);
+		writeNativeFile("src/profiling/second.cpp", export);
+
+		NativeCollectOperation.Result result = NativeCollectOperation.collect(root, java.util.List.of(nativeRoot),
+				coverageDir, indexFile, PluginLog.NOOP);
+
+		assertEquals(2, result.jniExportCount());
+		assertEquals(2, result.crossCheckEdgeCount());
+		DependencyMap after = DependencyMap.load(indexFile);
+		assertEquals(Set.of("com.example.Prod", "src/profiling/first.cpp", "src/profiling/second.cpp"),
+				after.get("com.example.FooTest"));
+	}
+
+	@Test
 	void crossCheckWorksWithoutCoverageArtifacts() throws IOException {
 		setup();
 		writeIndex();
@@ -166,6 +184,76 @@ class NativeCollectOperationTest {
 
 		DependencyMap after = DependencyMap.load(indexFile);
 		assertEquals(Set.of("com.example.Prod", "src/profiling/foo.cpp"), after.get("com.example.FooTest"));
+	}
+
+	@Test
+	void wrapperNativeFallbackCrossChecksWhenExportNameDiffersFromMemberDep() throws IOException {
+		setup();
+		// MEMBER deps record the public wrapper tests call; the JNI export is the
+		// *0 native impl — exact member-key intersection is empty by construction.
+		DependencyMap map = new DependencyMap();
+		map.put("com.example.WrapperTest", Set.of("com.example.Wrapper"));
+		map.putMemberDeps("com.example.WrapperTest", Set.of("com.example.Wrapper#blockEnter"));
+		// an unrelated test with no member deps on the wrapper class must gain nothing
+		map.put("com.example.UnrelatedTest", Set.of("com.example.Other"));
+		map.putMemberDeps("com.example.UnrelatedTest", Set.of("com.example.Other#whatever"));
+		map.save(indexFile);
+
+		writeNativeFile("src/profiling/wrapper.cpp",
+				"JNIEXPORT void JNICALL Java_com_example_Wrapper_blockEnter0(JNIEnv*, jobject) {}");
+
+		NativeCollectOperation.Result result = NativeCollectOperation.collect(root, java.util.List.of(nativeRoot),
+				coverageDir, indexFile, PluginLog.NOOP);
+		assertEquals(1, result.crossCheckTests());
+		assertEquals(1, result.crossCheckEdgeCount());
+
+		DependencyMap after = DependencyMap.load(indexFile);
+		assertEquals(Set.of("com.example.Wrapper", "src/profiling/wrapper.cpp"), after.get("com.example.WrapperTest"));
+		assertEquals(Set.of("com.example.Other"), after.get("com.example.UnrelatedTest"));
+	}
+
+	@Test
+	void wrapperNativeFallbackGroupsAllExportsOfOneClassPerTest() throws IOException {
+		setup();
+		DependencyMap map = new DependencyMap();
+		map.put("com.example.WrapperTest", Set.of("com.example.Wrapper"));
+		map.putMemberDeps("com.example.WrapperTest", Set.of("com.example.Wrapper#findFlag"));
+		map.save(indexFile);
+
+		writeNativeFile("src/profiling/a.cpp",
+				"JNIEXPORT void JNICALL Java_com_example_Wrapper_findFlag0(JNIEnv*, jobject) {}");
+		writeNativeFile("src/profiling/b.cpp",
+				"JNIEXPORT void JNICALL Java_com_example_Wrapper_flags0(JNIEnv*, jobject) {}");
+
+		NativeCollectOperation.Result result = NativeCollectOperation.collect(root, java.util.List.of(nativeRoot),
+				coverageDir, indexFile, PluginLog.NOOP);
+		// class-level fallback unions every file exporting the wrapper class
+		assertEquals(1, result.crossCheckTests());
+		assertEquals(2, result.crossCheckEdgeCount());
+		DependencyMap after = DependencyMap.load(indexFile);
+		assertEquals(Set.of("com.example.Wrapper", "src/profiling/a.cpp", "src/profiling/b.cpp"),
+				after.get("com.example.WrapperTest"));
+	}
+
+	@Test
+	void exactMemberKeyMatchStillWinsOverClassFallback() throws IOException {
+		setup();
+		DependencyMap map = new DependencyMap();
+		map.put("com.example.FooTest", Set.of("com.example.Foo"));
+		map.putMemberDeps("com.example.FooTest", Set.of("com.example.Foo#run"));
+		map.save(indexFile);
+
+		writeNativeFile("src/profiling/foo.cpp",
+				"JNIEXPORT void JNICALL Java_com_example_Foo_run(JNIEnv*, jobject) {}");
+		writeNativeFile("src/profiling/other.cpp",
+				"JNIEXPORT void JNICALL Java_com_example_Foo_run0(JNIEnv*, jobject) {}");
+
+		NativeCollectOperation.collect(root, java.util.List.of(nativeRoot), coverageDir, indexFile, PluginLog.NOOP);
+		DependencyMap after = DependencyMap.load(indexFile);
+		// exact match on run; class fallback adds other.cpp too (same class) — both
+		// edges land, the exact match is not displaced
+		assertEquals(Set.of("com.example.Foo", "src/profiling/foo.cpp", "src/profiling/other.cpp"),
+				after.get("com.example.FooTest"));
 	}
 
 	@Test
