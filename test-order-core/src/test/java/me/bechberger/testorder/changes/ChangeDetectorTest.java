@@ -2,11 +2,13 @@ package me.bechberger.testorder.changes;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -140,10 +142,51 @@ class ChangeDetectorTest {
 		pb.directory(dir.toFile());
 		pb.redirectErrorStream(true);
 		Process p = pb.start();
-		p.getInputStream().readAllBytes();
-		int exitCode = p.waitFor();
-		if (exitCode != 0) {
-			throw new RuntimeException("git " + String.join(" ", args) + " failed with exit code " + exitCode);
+		Thread drainer = null;
+		try {
+			try {
+				p.getOutputStream().close();
+			} catch (IOException ignored) {
+			}
+			ByteArrayOutputStream captured = new ByteArrayOutputStream();
+			drainer = new Thread(() -> {
+				try (var input = p.getInputStream()) {
+					input.transferTo(captured);
+				} catch (IOException ignored) {
+				}
+			}, "test-order-test-git-drain");
+			drainer.setDaemon(true);
+			drainer.start();
+			if (!p.waitFor(GitTimeout.seconds(), TimeUnit.SECONDS)) {
+				throw new IOException(
+						"git command timed out after " + GitTimeout.seconds() + "s: " + String.join(" ", args));
+			}
+			int exitCode = p.exitValue();
+			if (exitCode != 0) {
+				throw new RuntimeException("git " + String.join(" ", args) + " failed with exit code " + exitCode);
+			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw e;
+		} finally {
+			if (p.isAlive()) {
+				p.destroyForcibly();
+			}
+			if (drainer != null && drainer.isAlive()) {
+				drainer.interrupt();
+			}
+			try {
+				p.getOutputStream().close();
+			} catch (IOException ignored) {
+			}
+			try {
+				p.getInputStream().close();
+			} catch (IOException ignored) {
+			}
+			try {
+				p.getErrorStream().close();
+			} catch (IOException ignored) {
+			}
 		}
 	}
 

@@ -1,6 +1,7 @@
 package me.bechberger.testorder.ops;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -10,6 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.AbstractSet;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -17,6 +19,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import me.bechberger.testorder.DependencyMap;
+import me.bechberger.testorder.changes.NativeChangeDetector;
 
 class NativeCollectOperationTest {
 
@@ -71,6 +74,16 @@ class NativeCollectOperationTest {
 		map.put("com.example.FooTest", Set.of("com.example.Prod"));
 		map.putMemberDeps("com.example.FooTest", Set.of("com.example.Foo#run"));
 		map.save(indexFile);
+	}
+
+	@Test
+	void sharedNativeKeyPredicatesKeepForwardSlashSemantics() {
+		assertFalse(NativeChangeDetector.isAbsoluteNativeKey("src/native.cpp"));
+		assertTrue(NativeChangeDetector.isAbsoluteNativeKey("/tmp/native.cpp"));
+		assertTrue(NativeChangeDetector.isAbsoluteNativeKey("C:/src/native.cpp"));
+		assertFalse(NativeChangeDetector.isAbsoluteNativeKey("C:\\src\\native.cpp"));
+		assertTrue(NativeChangeDetector.looksPathLike("src/native.cpp"));
+		assertFalse(NativeChangeDetector.looksPathLike("com.example.Foo"));
 	}
 
 	@Test
@@ -170,6 +183,42 @@ class NativeCollectOperationTest {
 		DependencyMap after = DependencyMap.load(indexFile);
 		assertEquals(Set.of("com.example.Prod", "src/profiling/first.cpp", "src/profiling/second.cpp"),
 				after.get("com.example.FooTest"));
+	}
+
+	@Test
+	void absoluteJniKeysAreWarnedAndFilteredBeforeCrossCheckCounts() throws IOException {
+		setup();
+		writeIndex();
+		Path outsideRoot = tempDir.resolve("external-native");
+		Path source = outsideRoot.resolve("external.cpp");
+		Files.createDirectories(outsideRoot);
+		Files.writeString(source, "JNIEXPORT void JNICALL Java_com_example_Foo_run(JNIEnv*, jobject) {}");
+		List<String> logWarnings = new java.util.ArrayList<>();
+		PluginLog log = new PluginLog() {
+			@Override
+			public void info(String message) {
+			}
+
+			@Override
+			public void warn(String message) {
+				logWarnings.add(message);
+			}
+
+			@Override
+			public void debug(String message) {
+			}
+		};
+
+		NativeCollectOperation.Result result = NativeCollectOperation.collect(root, java.util.List.of(outsideRoot),
+				coverageDir, indexFile, log);
+
+		String absoluteKey = source.toAbsolutePath().normalize().toString().replace('\\', '/');
+		assertEquals(1, result.jniExportCount());
+		assertEquals(0, result.crossCheckEdgeCount());
+		assertTrue(logWarnings.stream().anyMatch(warning -> warning.contains(absoluteKey)));
+		DependencyMap after = DependencyMap.load(indexFile);
+		assertFalse(after.get("com.example.FooTest").contains(absoluteKey));
+		assertEquals(Set.of("com.example.Prod"), after.get("com.example.FooTest"));
 	}
 
 	@Test

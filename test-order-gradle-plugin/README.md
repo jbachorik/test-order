@@ -412,11 +412,13 @@ testOrder {
 When `nativeTests` is configured (and only then):
 
 - **Change detection** hashes the declared `sourceRoots` (`.cpp`, `.cc`, `.c`,
-  `.cxx`, `.c++`, `.hpp`, `.hh`, `.h`, `.hxx`) into
-  `.test-order/native-hashes.lz4` and treats changed files as changed units —
-  tests with native edges get selected exactly like tests depending on changed
-  Java classes. In `explicit` change mode only the explicit class list is used
-  (there is no explicit native-path input yet).
+  `.cxx`, `.c++`, `.hpp`, `.hh`, `.h`, `.hxx`) into a native snapshot under the
+  build root's `.test-order` directory: root/standalone projects use
+  `.test-order/native-hashes.lz4`, while subprojects use
+  `.test-order/hashes/<projectName>-native-hashes.lz4`. Changed files are
+  treated as changed units — tests with native edges get selected exactly like
+  tests depending on changed Java classes. In `explicit` change mode only the
+  explicit class list is used (there is no explicit native-path input yet).
 - **`testOrderNativeCollect`** merges per-test native coverage artifacts from
   `coverageDir` and Java↔native cross-check edges into the dependency index.
   Run it after your native test/coverage step:
@@ -541,7 +543,7 @@ When no scoring weights are set in the DSL, the plugin uses optimizer-tuned valu
 | `.test-order/state.lz4` | Optional | Test durations, failure history, run records |
 | `.test-order/ml/history.lz4` | Optional | ML run history (when `ml.enabled=true`) |
 | `.test-order/hashes.lz4` | No | Source hash snapshot for since-last-run change detection |
-| `.test-order/native-hashes.lz4` | No | Native source hash snapshot (when `nativeTests` is configured) |
+| `.test-order/native-hashes.lz4` (root/standalone); `.test-order/hashes/<projectName>-native-hashes.lz4` (subproject) | No | Native source hash snapshot (when `nativeTests` is configured) |
 | `build/test-order-deps/` | No | Intermediate `.deps` files (cleaned by `testOrderClean`) |
 
 ## ML Failure Predictions

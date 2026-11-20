@@ -2,6 +2,7 @@ package me.bechberger.testorder.nativecov;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -12,6 +13,8 @@ import java.util.Set;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+
+import me.bechberger.testorder.changes.NativeChangeDetector;
 
 /**
  * Tolerance is the point of the extractor: gcov notes format versions vary
@@ -51,6 +54,44 @@ class CompiledNativeSourcesTest {
 		Set<String> keys = CompiledNativeSources.compiledSourceKeys(List.of(binaryDir), base, List.of(roots));
 
 		assertEquals(Set.of("src/profiling/foo.cpp", "src/profiling/bar.cpp", "src/profiling/baz.cpp"), keys);
+	}
+
+	@Test
+	void emittedKeysMatchNativeChangeDetectorAndRepeatedCandidatesAreDeduplicated() throws IOException {
+		Path base = tempDir.resolve("project");
+		Path roots = base.resolve("src/profiling");
+		Path binaryDir = base.resolve("build/objects");
+		Files.createDirectories(roots);
+		Files.createDirectories(binaryDir);
+		Path source = base.toAbsolutePath().resolve("src/profiling/repeated.cpp");
+		Files.writeString(binaryDir.resolve("repeated.gcno"), gcno(source.toString(), source.toString()),
+				StandardCharsets.ISO_8859_1);
+
+		Set<String> keys = CompiledNativeSources.compiledSourceKeys(List.of(binaryDir), base, List.of(roots));
+
+		assertEquals(Set.of(NativeChangeDetector.nativeKey(base, source)), keys);
+	}
+
+	@Test
+	void symlinkedKeyBaseStillEmitsLexicalUnitKeys() throws IOException {
+		Path base = tempDir.resolve("project-real");
+		Path roots = base.resolve("src/profiling");
+		Path binaryDir = base.resolve("build/objects");
+		Files.createDirectories(roots);
+		Files.createDirectories(binaryDir);
+		Path alias = tempDir.resolve("project-alias");
+		try {
+			Files.createSymbolicLink(alias, base);
+		} catch (IOException | UnsupportedOperationException | SecurityException e) {
+			assumeTrue(false, "symbolic links are not supported in this environment: " + e.getMessage());
+		}
+		Path source = alias.resolve("src/profiling/alias.cpp");
+		Files.writeString(binaryDir.resolve("alias.gcno"), gcno(source.toString()), StandardCharsets.ISO_8859_1);
+
+		Set<String> keys = CompiledNativeSources.compiledSourceKeys(List.of(binaryDir), alias,
+				List.of(alias.resolve("src/profiling")));
+
+		assertEquals(Set.of(NativeChangeDetector.nativeKey(alias, source)), keys);
 	}
 
 	@Test

@@ -128,7 +128,7 @@ public final class JniExportScanner {
 					if (Files.size(file) > MAX_FILE_BYTES) {
 						continue;
 					}
-					Set<String> found = scanFile(Files.readString(file, StandardCharsets.UTF_8));
+					Set<String> found = scanFile(Files.readString(file, StandardCharsets.ISO_8859_1));
 					if (!found.isEmpty()) {
 						exports.computeIfAbsent(me.bechberger.testorder.changes.NativeChangeDetector
 								.nativeKey(projectRoot, declaredFile), k -> new TreeSet<>()).addAll(found);

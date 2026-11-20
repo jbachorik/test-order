@@ -265,6 +265,8 @@ When multiple subprojects share an index, their project-relative native keys can
 
 Native declarations are aggregated across the build: an order/affected workflow running on a project *without* `nativeTests` (e.g. `:ddprof-test` while `:ddprof-lib` owns the native sources) still detects native changes owned by sibling projects, keyed owning-project-relative — a `.cpp` change in one module selects the Java tests in another whose profiles exercise it.
 
+Native hash snapshots use `.test-order/native-hashes.lz4` for root/standalone projects and `.test-order/hashes/<projectName>-native-hashes.lz4` for subprojects, under the build root's `.test-order` directory.
+
 </details>
 
 <details>

@@ -245,7 +245,7 @@ public final class NativeCoverageParser {
 			return;
 		}
 		String key = NativeChangeDetector.nativeKey(projectRoot, resolved);
-		boolean underRoot = !isAbsoluteNativeKey(key)
+		boolean underRoot = !NativeChangeDetector.isAbsoluteNativeKey(key)
 				&& rootPrefixes.stream().anyMatch(prefix -> prefix.isEmpty() || key.startsWith(prefix));
 		if (!underRoot) {
 			warnings.add("Covered file " + key + " (test " + test
@@ -272,10 +272,6 @@ public final class NativeCoverageParser {
 			}
 		}
 		return false;
-	}
-
-	private static boolean isAbsoluteNativeKey(String key) {
-		return key.startsWith("/") || key.matches("^[A-Za-z]:/.*");
 	}
 
 	/**

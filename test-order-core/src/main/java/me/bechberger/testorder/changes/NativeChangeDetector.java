@@ -8,6 +8,7 @@ import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
@@ -92,7 +93,20 @@ public final class NativeChangeDetector {
 		Objects.requireNonNull(mode);
 		// Explicit paths always take precedence, mirroring explicit changedClasses.
 		if (explicitPaths != null && !explicitPaths.isBlank()) {
-			return ChangeDetectionSupport.parseExplicitClasses(explicitPaths);
+			Path absoluteRoot = projectRoot.toAbsolutePath().normalize();
+			Set<String> normalized = new LinkedHashSet<>();
+			for (String entry : ChangeDetectionSupport.parseExplicitClasses(explicitPaths)) {
+				String portableEntry = entry.replace('\\', '/');
+				try {
+					Path path = Path.of(portableEntry);
+					Path absolute = path.isAbsolute() ? path : absoluteRoot.resolve(path);
+					normalized.add(nativeKey(absoluteRoot, absolute));
+				} catch (InvalidPathException e) {
+					// Preserve malformed explicit values rather than silently dropping an override.
+					normalized.add(portableEntry);
+				}
+			}
+			return normalized;
 		}
 		if (nativeRoots == null || nativeRoots.isEmpty()) {
 			return Set.of();
@@ -217,9 +231,10 @@ public final class NativeChangeDetector {
 	 * slashes; absolute path when outside the project root.
 	 */
 	public static String nativeKey(Path projectRoot, Path file) {
+		Path normalizedRoot = projectRoot.toAbsolutePath().normalize();
 		Path absolute = file.toAbsolutePath().normalize();
 		try {
-			String relative = projectRoot.relativize(absolute).toString().replace('\\', '/');
+			String relative = normalizedRoot.relativize(absolute).toString().replace('\\', '/');
 			if (!relative.startsWith("../")) {
 				return relative;
 			}
@@ -227,6 +242,18 @@ public final class NativeChangeDetector {
 			// different root (e.g. declared source root outside the project)
 		}
 		return absolute.toString().replace('\\', '/');
+	}
+
+	/**
+	 * Whether a native unit key is an absolute Unix or forward-slash drive path.
+	 */
+	public static boolean isAbsoluteNativeKey(String key) {
+		return key.startsWith("/") || key.matches("^[A-Za-z]:/.*");
+	}
+
+	/** Whether a dependency value contains a forward-slash path separator. */
+	public static boolean looksPathLike(String key) {
+		return key.indexOf('/') >= 0;
 	}
 
 	private static Set<String> diffHashes(Map<String, String> previous, Map<String, String> current) {

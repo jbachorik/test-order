@@ -2,10 +2,12 @@ package me.bechberger.testorder.ops.workflows;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 
 import javax.tools.*;
 
@@ -14,6 +16,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import me.bechberger.testorder.DependencyMap;
+import me.bechberger.testorder.changes.GitTimeout;
 import me.bechberger.testorder.ops.PluginContext;
 import me.bechberger.testorder.ops.PluginLog;
 
@@ -550,9 +553,51 @@ class ChangeAnalysisMultiModuleTest {
 		pb.environment().put("GIT_CONFIG_VALUE_5", "false");
 		pb.redirectErrorStream(true);
 		Process p = pb.start();
-		p.getInputStream().readAllBytes();
-		int exit = p.waitFor();
-		if (exit != 0)
-			throw new RuntimeException("git " + String.join(" ", args) + " failed (" + exit + ")");
+		Thread drainer = null;
+		try {
+			try {
+				p.getOutputStream().close();
+			} catch (IOException ignored) {
+			}
+			ByteArrayOutputStream captured = new ByteArrayOutputStream();
+			drainer = new Thread(() -> {
+				try (var input = p.getInputStream()) {
+					input.transferTo(captured);
+				} catch (IOException ignored) {
+				}
+			}, "test-order-test-git-drain");
+			drainer.setDaemon(true);
+			drainer.start();
+			if (!p.waitFor(GitTimeout.seconds(), TimeUnit.SECONDS)) {
+				throw new IOException(
+						"git command timed out after " + GitTimeout.seconds() + "s: " + String.join(" ", args));
+			}
+			int exit = p.exitValue();
+			if (exit != 0) {
+				throw new RuntimeException("git " + String.join(" ", args) + " failed (" + exit + ")");
+			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw e;
+		} finally {
+			if (p.isAlive()) {
+				p.destroyForcibly();
+			}
+			if (drainer != null && drainer.isAlive()) {
+				drainer.interrupt();
+			}
+			try {
+				p.getOutputStream().close();
+			} catch (IOException ignored) {
+			}
+			try {
+				p.getInputStream().close();
+			} catch (IOException ignored) {
+			}
+			try {
+				p.getErrorStream().close();
+			} catch (IOException ignored) {
+			}
+		}
 	}
 }

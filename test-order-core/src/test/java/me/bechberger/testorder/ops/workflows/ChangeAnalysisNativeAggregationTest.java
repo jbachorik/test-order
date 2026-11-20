@@ -1,20 +1,24 @@
 package me.bechberger.testorder.ops.workflows;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import me.bechberger.testorder.DependencyMap;
 import me.bechberger.testorder.changes.ChangeDetector;
+import me.bechberger.testorder.changes.GitTimeout;
 import me.bechberger.testorder.changes.NativeChangeDetector;
 import me.bechberger.testorder.ops.PluginContext;
 import me.bechberger.testorder.ops.PluginLog;
@@ -50,9 +54,50 @@ class ChangeAnalysisNativeAggregationTest {
 		pb.environment().put("GIT_CONFIG_VALUE_2", "t");
 		pb.redirectErrorStream(true);
 		Process p = pb.start();
-		p.getInputStream().readAllBytes();
-		if (p.waitFor() != 0) {
-			throw new RuntimeException("git " + String.join(" ", args) + " failed");
+		Thread drainer = null;
+		try {
+			try {
+				p.getOutputStream().close();
+			} catch (IOException ignored) {
+			}
+			ByteArrayOutputStream captured = new ByteArrayOutputStream();
+			drainer = new Thread(() -> {
+				try (var input = p.getInputStream()) {
+					input.transferTo(captured);
+				} catch (IOException ignored) {
+				}
+			}, "test-order-test-git-drain");
+			drainer.setDaemon(true);
+			drainer.start();
+			if (!p.waitFor(GitTimeout.seconds(), TimeUnit.SECONDS)) {
+				throw new IOException(
+						"git command timed out after " + GitTimeout.seconds() + "s: " + String.join(" ", args));
+			}
+			if (p.exitValue() != 0) {
+				throw new RuntimeException("git " + String.join(" ", args) + " failed");
+			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw e;
+		} finally {
+			if (p.isAlive()) {
+				p.destroyForcibly();
+			}
+			if (drainer != null && drainer.isAlive()) {
+				drainer.interrupt();
+			}
+			try {
+				p.getOutputStream().close();
+			} catch (IOException ignored) {
+			}
+			try {
+				p.getInputStream().close();
+			} catch (IOException ignored) {
+			}
+			try {
+				p.getErrorStream().close();
+			} catch (IOException ignored) {
+			}
 		}
 	}
 
@@ -142,25 +187,41 @@ class ChangeAnalysisNativeAggregationTest {
 
 	@Test
 	void singleProjectFieldsSynthesizeOneNativeEntry() {
-		// legacy shape: builder sets roots + hash file without explicit entries
-		PluginContext ctx = PluginContext.builder().projectRoot(tempDir)
-				.nativeRoots(List.of(tempDir.resolve("src/cpp"))).nativeHashFile(tempDir.resolve("native-hashes.lz4"))
-				.build();
+		// Legacy builder shape: roots alone synthesize an entry and its default
+		// snapshot.
+		Path projectRoot = tempDir.resolve("project");
+		Path nativeProjectRoot = tempDir.resolve("native-project");
+		Path nativeRoot = nativeProjectRoot.resolve("src/cpp");
+		Path defaultHashFile = nativeProjectRoot.resolve(".test-order/native-hashes.lz4");
+		PluginContext ctx = PluginContext.builder().projectRoot(projectRoot).nativeProjectRoot(nativeProjectRoot)
+				.nativeRoots(List.of(nativeRoot)).build();
 		assertEquals(1, ctx.nativeProjects().size());
-		assertEquals(tempDir, ctx.nativeProjects().get(0).keyBase());
-		assertEquals(tempDir.resolve("native-hashes.lz4"), ctx.nativeProjects().get(0).hashFile());
-		assertEquals(List.of(tempDir.resolve("src/cpp")), ctx.nativeProjects().get(0).roots());
+		assertEquals(nativeProjectRoot, ctx.nativeProjects().get(0).keyBase());
+		assertEquals(defaultHashFile, ctx.nativeProjects().get(0).hashFile());
+		assertEquals(defaultHashFile, ctx.nativeHashFile());
+		assertEquals(List.of(nativeRoot), ctx.nativeProjects().get(0).roots());
 
-		// explicit entries win; no synthesis on top
-		PluginContext aggregated = PluginContext.builder().projectRoot(tempDir)
-				.nativeRoots(List.of(tempDir.resolve("src/cpp"))).nativeHashFile(tempDir.resolve("native-hashes.lz4"))
+		// An explicit single-project hash path remains an override.
+		Path overrideHashFile = tempDir.resolve("custom-native-hashes.lz4");
+		PluginContext overridden = PluginContext.builder().projectRoot(projectRoot).nativeProjectRoot(nativeProjectRoot)
+				.nativeRoots(List.of(nativeRoot)).nativeHashFile(overrideHashFile).build();
+		assertEquals(overrideHashFile, overridden.nativeProjects().get(0).hashFile());
+		assertEquals(overrideHashFile, overridden.nativeHashFile());
+
+		// Explicit aggregate entries win; no synthesis on top.
+		PluginContext aggregated = PluginContext.builder().projectRoot(projectRoot).nativeProjectRoot(nativeProjectRoot)
+				.nativeRoots(List.of(nativeRoot))
 				.nativeProjects(List.of(new PluginContext.NativeProjectEntry(tempDir.resolve("other"),
 						tempDir.resolve("other-h.lz4"), List.of(tempDir.resolve("other/cpp")))))
 				.build();
 		assertEquals(1, aggregated.nativeProjects().size());
 		assertEquals(tempDir.resolve("other"), aggregated.nativeProjects().get(0).keyBase());
+		PluginContext emptyAggregate = PluginContext.builder().projectRoot(projectRoot).nativeRoots(List.of(nativeRoot))
+				.nativeProjects(List.of()).build();
+		assertTrue(emptyAggregate.nativeProjects().isEmpty());
+		assertNull(emptyAggregate.nativeHashFile());
 
-		// no native config at all → empty
+		// No native config at all → empty.
 		assertEquals(0, PluginContext.builder().projectRoot(tempDir).build().nativeProjects().size());
 	}
 

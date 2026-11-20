@@ -9,6 +9,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Shared git subprocess utilities used by {@link GitChangeDetector} and
@@ -81,6 +82,7 @@ final class GitSupport {
 		// redirect and redirectInput rejects it outright. The pipe is closed
 		// immediately after start so any git command reading stdin sees EOF.
 		ByteArrayOutputStream captured = new ByteArrayOutputStream();
+		AtomicBoolean drainCompleted = new AtomicBoolean(false);
 		Thread drainer = null;
 		boolean waitCompleted = false;
 		Process process = processStarter.start(pb);
@@ -94,6 +96,7 @@ final class GitSupport {
 			drainer = new Thread(() -> {
 				try (var input = process.getInputStream()) {
 					input.transferTo(captured);
+					drainCompleted.set(true);
 				} catch (IOException ignored) {
 				}
 			}, "test-order-git-drain");
@@ -113,6 +116,12 @@ final class GitSupport {
 			}
 			waitCompleted = true;
 			drainer.join(2000);
+			if (!drainCompleted.get()) {
+				if (throwOnError) {
+					throw new IOException("git command output drain did not complete: " + String.join(" ", command));
+				}
+				return new byte[0];
+			}
 			byte[] output = captured.toByteArray();
 			if (process.exitValue() != 0) {
 				if (throwOnError) {

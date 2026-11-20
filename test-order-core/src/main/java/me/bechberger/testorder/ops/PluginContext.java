@@ -155,15 +155,24 @@ public final class PluginContext {
 		this.testHashFile = b.testHashFile;
 		this.methodHashFile = b.methodHashFile;
 		this.bytecodeHashFile = b.bytecodeHashFile;
-		this.nativeHashFile = b.nativeHashFile;
 		this.nativeRoots = b.nativeRoots != null ? List.copyOf(b.nativeRoots) : List.of();
+		Path resolvedNativeHashFile = b.nativeHashFile;
+		if (b.nativeProjects == null && !this.nativeRoots.isEmpty()) {
+			if (this.nativeProjectRoot == null) {
+				throw new IllegalArgumentException("A native project root is required for configured native roots");
+			}
+			if (resolvedNativeHashFile == null) {
+				resolvedNativeHashFile = this.nativeProjectRoot.resolve(".test-order/native-hashes.lz4");
+			}
+		}
+		this.nativeHashFile = resolvedNativeHashFile;
 		// Normalize the native declarations into per-project entries: explicit
 		// aggregated entries win (the Gradle plugin aggregates across the build);
 		// otherwise the single-project fields synthesize one entry so consumers of
 		// nativeProjects() see a uniform view regardless of how the context was built.
 		if (b.nativeProjects != null) {
 			this.nativeProjects = List.copyOf(b.nativeProjects);
-		} else if (!this.nativeRoots.isEmpty() && this.nativeHashFile != null) {
+		} else if (!this.nativeRoots.isEmpty()) {
 			this.nativeProjects = List
 					.of(new NativeProjectEntry(this.nativeProjectRoot, this.nativeHashFile, this.nativeRoots));
 		} else {

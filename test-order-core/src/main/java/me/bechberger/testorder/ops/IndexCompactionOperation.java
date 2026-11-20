@@ -8,6 +8,7 @@ import java.util.Set;
 
 import me.bechberger.testorder.DependencyMap;
 import me.bechberger.testorder.PersistenceSupport;
+import me.bechberger.testorder.changes.NativeChangeDetector;
 
 /**
  * Index compaction operation to rebuild index from .deps files. Useful for
@@ -84,6 +85,8 @@ public final class IndexCompactionOperation {
 			try {
 				DependencyMap previous = DependencyMap.load(outputFile);
 				Map<String, Set<String>> nativeDeps = new java.util.LinkedHashMap<>();
+				Set<String> currentTests = mergedMap.testClasses();
+				Set<String> droppedNativeTests = new java.util.TreeSet<>();
 				int nativeEdgeCount = 0;
 				int unmarkedPathCount = 0;
 				int absoluteNativeCount = 0;
@@ -91,23 +94,31 @@ public final class IndexCompactionOperation {
 					Set<String> paths = new java.util.TreeSet<>();
 					for (String dep : previous.get(test)) {
 						if (previous.isNativeUnit(dep)) {
-							if (isAbsoluteNativeKey(dep)) {
+							if (NativeChangeDetector.isAbsoluteNativeKey(dep)) {
 								absoluteNativeCount++;
 							} else {
 								paths.add(dep);
 							}
-						} else if (looksPathLike(dep)) {
+						} else if (NativeChangeDetector.looksPathLike(dep)) {
 							unmarkedPathCount++;
 						}
 					}
 					if (!paths.isEmpty()) {
-						nativeDeps.put(test, paths);
-						nativeEdgeCount += paths.size();
+						if (currentTests.contains(test)) {
+							nativeDeps.put(test, paths);
+							nativeEdgeCount += paths.size();
+						} else {
+							droppedNativeTests.add(test);
+						}
 					}
 				}
 				if (!nativeDeps.isEmpty()) {
 					mergedMap = mergedMap.withNativeAugmentation(nativeDeps);
 					log.info("Preserved " + nativeEdgeCount + " native edge(s) from the previous index");
+				}
+				if (!droppedNativeTests.isEmpty()) {
+					log.warn("Did not preserve native edges for test class(es) absent from rebuilt .deps data: "
+							+ String.join(", ", droppedNativeTests));
 				}
 				if (absoluteNativeCount > 0) {
 					log.warn("Skipped " + absoluteNativeCount + " absolute native unit key(s) from the previous index");
@@ -161,14 +172,6 @@ public final class IndexCompactionOperation {
 		public long removedTests() {
 			return Math.max(0, beforeTestCount - afterTestCount);
 		}
-	}
-
-	private static boolean isAbsoluteNativeKey(String key) {
-		return key.startsWith("/") || key.matches("^[A-Za-z]:/.*");
-	}
-
-	private static boolean looksPathLike(String key) {
-		return key.indexOf('/') >= 0;
 	}
 
 	private static String formatBytes(long bytes) {

@@ -74,6 +74,20 @@ class JniExportScannerTest {
 	}
 
 	@Test
+	void scanContinuesAfterMalformedUtf8Bytes(@TempDir Path tempDir) throws Exception {
+		Path root = tempDir.resolve("natives");
+		Path source = root.resolve("malformed.cpp");
+		Files.createDirectories(root);
+		byte[] validPrefix = "void Java_com_example_Foo_run(JNIEnv*, jobject) {};".getBytes(StandardCharsets.UTF_8);
+		byte[] contents = java.util.Arrays.copyOf(validPrefix, validPrefix.length + 1);
+		contents[validPrefix.length] = (byte) 0xFF;
+		Files.write(source, contents);
+
+		assertEquals(Map.of("natives/malformed.cpp", Set.of("com.example.Foo#run")),
+				JniExportScanner.scan(tempDir, List.of(root)));
+	}
+
+	@Test
 	void scanIncludesHeaderFilesAndSharedNativeExtensions(@TempDir Path tempDir) throws Exception {
 		Path root = tempDir.resolve("natives");
 		Path header = root.resolve("profiling/foo.h");

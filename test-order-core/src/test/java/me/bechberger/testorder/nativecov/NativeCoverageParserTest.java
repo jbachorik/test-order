@@ -12,6 +12,8 @@ import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import me.bechberger.testorder.changes.NativeChangeDetector;
+
 class NativeCoverageParserTest {
 
 	@TempDir
@@ -45,6 +47,18 @@ class NativeCoverageParserTest {
 		assertEquals(1, result.artifactsParsed());
 		assertEquals(Set.of("src/profiling/foo.cpp", "src/profiling/bar.hpp"),
 				result.testToFiles().get("com.example.FooTest"));
+	}
+
+	@Test
+	void coveredPathUsesTheSharedNativeUnitKey() throws Exception {
+		setup();
+		writeArtifact("com.example.KeyTest.json",
+				"{\"test\":\"com.example.KeyTest\",\"coveredFiles\":[\"src/profiling/foo.cpp\"]}");
+
+		NativeCoverageParser.Result result = NativeCoverageParser.parse(root, coverageDir, nativeRoots);
+		String expected = NativeChangeDetector.nativeKey(root, root.resolve("src/profiling/foo.cpp"));
+
+		assertEquals(Set.of(expected), result.testToFiles().get("com.example.KeyTest"));
 	}
 
 	@Test

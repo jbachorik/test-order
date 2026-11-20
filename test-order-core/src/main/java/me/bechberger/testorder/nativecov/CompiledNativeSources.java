@@ -5,7 +5,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.regex.Matcher;
@@ -68,17 +70,51 @@ public final class CompiledNativeSources {
 		if (binaries == null || binaries.isEmpty() || keyBase == null || roots == null || roots.isEmpty()) {
 			return keys;
 		}
-		// Canonicalize through symlinks: on macOS the temp root is /var (JUnit,
-		// and often the recorded compile path) while Gradle hands out the
-		// canonical /private/var — without toRealPath the two never match and
-		// scoping silently disables.
-		Path base = realOrNormalized(keyBase);
+		Path lexicalBase = keyBase.toAbsolutePath().normalize();
+		// Canonical forms are used only for containment. Keep the lexical base
+		// separately so emitted keys match NativeChangeDetector.nativeKey.
+		Path canonicalBase = realOrNormalized(lexicalBase);
+		List<Path> canonicalRoots = new ArrayList<>();
+		for (Path root : roots) {
+			if (root != null) {
+				Path absoluteRoot = root.isAbsolute() ? root : lexicalBase.resolve(root);
+				canonicalRoots.add(realOrNormalized(absoluteRoot));
+			}
+		}
+		ResolutionContext context = new ResolutionContext(lexicalBase, canonicalBase, canonicalRoots);
 		for (Path binary : binaries) {
 			for (Path notes : notesFilesFor(binary)) {
-				keys.addAll(sourceKeysInNotes(notes, base, roots));
+				keys.addAll(sourceKeysInNotes(notes, context));
 			}
 		}
 		return keys;
+	}
+
+	/** Holds per-invocation lexical keys and cached canonical containment paths. */
+	private static final class ResolutionContext {
+		private final Path lexicalBase;
+		private final Path canonicalBase;
+		private final List<Path> canonicalRoots;
+		private final Map<Path, Path> canonicalCandidates = new HashMap<>();
+
+		private ResolutionContext(Path lexicalBase, Path canonicalBase, List<Path> canonicalRoots) {
+			this.lexicalBase = lexicalBase;
+			this.canonicalBase = canonicalBase;
+			this.canonicalRoots = List.copyOf(canonicalRoots);
+		}
+
+		private Path canonicalCandidate(Path candidate) {
+			Path normalized = candidate.toAbsolutePath().normalize();
+			return canonicalCandidates.computeIfAbsent(normalized, CompiledNativeSources::realOrNormalized);
+		}
+
+		private Path canonicalBase() {
+			return canonicalBase;
+		}
+
+		private List<Path> canonicalRoots() {
+			return canonicalRoots;
+		}
 	}
 
 	private static Path realOrNormalized(Path path) {
@@ -133,7 +169,7 @@ public final class CompiledNativeSources {
 	 * directory and {@code base} (build systems record either, depending on the
 	 * invocation directory).
 	 */
-	private static Set<String> sourceKeysInNotes(Path notes, Path base, List<Path> roots) throws IOException {
+	private static Set<String> sourceKeysInNotes(Path notes, ResolutionContext context) throws IOException {
 		Set<String> keys = new TreeSet<>();
 		if (Files.size(notes) > MAX_GCNO_BYTES) {
 			return keys;
@@ -142,9 +178,15 @@ public final class CompiledNativeSources {
 		String text = new String(bytes, StandardCharsets.ISO_8859_1);
 		Matcher matcher = SOURCE_PATH.matcher(text);
 		while (matcher.find()) {
-			for (String candidate : resolveCandidate(matcher.group().trim(), notes, base)) {
-				if (isUnderRoots(candidate, base, roots)) {
-					keys.add(candidate);
+			for (Path candidate : resolveCandidate(matcher.group().trim(), notes, context.lexicalBase)) {
+				if (isUnderRoots(candidate, context)) {
+					// Emit the key relative to the CANONICAL base: build systems record
+					// absolute paths under either form of a symlinked base (macOS /var
+					// vs /private/var), so only canonical-vs-canonical containment and
+					// relativization match every recording. The resulting relative key
+					// is identical to the lexical form when no symlink is involved, so
+					// the keys still match NativeChangeDetector.nativeKey and the index.
+					keys.add(relativizeForward(candidate, context.canonicalBase()));
 				}
 			}
 		}
@@ -152,42 +194,45 @@ public final class CompiledNativeSources {
 	}
 
 	/**
-	 * Candidate unit-key forms for one extracted path: absolute relativized, or
-	 * both relative bases.
+	 * Candidate absolute lexical paths for one extracted path: the absolute path,
+	 * or both relative interpretations (notes directory and key base).
 	 */
-	private static List<String> resolveCandidate(String raw, Path notes, Path base) {
-		List<String> forms = new ArrayList<>();
+	private static List<Path> resolveCandidate(String raw, Path notes, Path lexicalBase) {
+		List<Path> candidates = new ArrayList<>();
 		String normalized = raw.replace('\\', '/');
-		Path p = Path.of(normalized);
-		Path absolute = p.isAbsolute() ? p : null;
-		if (absolute == null) {
-			Path viaNotesDir = notes.getParent() == null ? null : notes.getParent().resolve(p);
-			Path viaBase = base.resolve(p);
-			if (viaNotesDir != null && startsWith(viaNotesDir, base)) {
-				forms.add(relativizeForward(viaNotesDir, base));
-			}
-			forms.add(relativizeForward(viaBase, base));
-			return forms;
+		Path path = Path.of(normalized);
+		if (path.isAbsolute()) {
+			candidates.add(path.toAbsolutePath().normalize());
+			return candidates;
 		}
-		if (startsWith(absolute, base)) {
-			forms.add(relativizeForward(absolute, base));
+		Path viaNotesDir = notes.getParent() == null ? null : notes.getParent().resolve(path);
+		Path viaBase = lexicalBase.resolve(path);
+		if (viaNotesDir != null) {
+			candidates.add(viaNotesDir.toAbsolutePath().normalize());
 		}
-		return forms;
+		candidates.add(viaBase.toAbsolutePath().normalize());
+		return candidates;
 	}
 
-	private static boolean startsWith(Path path, Path base) {
-		return realOrNormalized(path).startsWith(base);
-	}
-
+	/**
+	 * Relativizes the candidate's canonical form against the canonical base,
+	 * forward slashes.
+	 */
 	private static String relativizeForward(Path path, Path base) {
 		return base.relativize(realOrNormalized(path)).toString().replace('\\', '/');
 	}
 
-	/** Whether a project-relative unit key lies under one of the declared roots. */
-	private static boolean isUnderRoots(String key, Path base, List<Path> roots) {
-		Path absolute = base.resolve(key);
-		for (Path root : roots) {
-			if (realOrNormalized(absolute).startsWith(realOrNormalized(root))) {
+	/**
+	 * Whether a candidate's canonical form lies under the canonical base and a
+	 * declared root.
+	 */
+	private static boolean isUnderRoots(Path candidate, ResolutionContext context) {
+		Path canonicalCandidate = context.canonicalCandidate(candidate);
+		if (!canonicalCandidate.startsWith(context.canonicalBase())) {
+			return false;
+		}
+		for (Path canonicalRoot : context.canonicalRoots()) {
+			if (canonicalCandidate.startsWith(canonicalRoot)) {
 				return true;
 			}
 		}

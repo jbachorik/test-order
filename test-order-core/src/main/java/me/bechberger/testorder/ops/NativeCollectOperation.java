@@ -13,6 +13,7 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 
 import me.bechberger.testorder.DependencyMap;
+import me.bechberger.testorder.changes.NativeChangeDetector;
 import me.bechberger.testorder.nativecov.JniExportScanner;
 import me.bechberger.testorder.nativecov.NativeCoverageParser;
 
@@ -234,7 +235,7 @@ public final class NativeCollectOperation {
 		for (Map.Entry<String, Set<String>> entry : source.entrySet()) {
 			Set<String> paths = new TreeSet<>();
 			for (String path : entry.getValue()) {
-				if (isAbsoluteNativeKey(path)) {
+				if (NativeChangeDetector.isAbsoluteNativeKey(path)) {
 					warnings.add("Ignoring absolute native unit key '" + path + "'");
 				} else {
 					paths.add(path);
@@ -245,10 +246,6 @@ public final class NativeCollectOperation {
 			}
 		}
 		return filtered;
-	}
-
-	private static boolean isAbsoluteNativeKey(String key) {
-		return key.startsWith("/") || key.matches("^[A-Za-z]:/.*");
 	}
 
 	/** Class part of a {@code className#methodName} method key. */

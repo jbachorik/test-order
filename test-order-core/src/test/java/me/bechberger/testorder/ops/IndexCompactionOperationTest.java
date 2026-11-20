@@ -89,6 +89,52 @@ class IndexCompactionOperationTest {
 	}
 
 	@Test
+	void warnsAndDropsNativeEdgesForTestsAbsentFromRebuiltDeps() throws IOException {
+		Path depsDir = tempDir.resolve("deps");
+		Files.createDirectories(depsDir);
+		String currentTest = "com.example.CurrentTest";
+		String staleTest = "com.example.StaleTest";
+		Files.writeString(depsDir.resolve(currentTest + ".deps"), "com.example.Current\n");
+		Path indexFile = tempDir.resolve("test-order.idx");
+
+		DependencyMap oldMap = new DependencyMap();
+		oldMap.put(currentTest, Set.of("com.example.Current"));
+		oldMap.put(staleTest, Set.of("com.example.Stale"));
+		oldMap = oldMap.withNativeAugmentation(
+				Map.of(currentTest, Set.of("src/current.cpp"), staleTest, Set.of("src/stale.cpp")));
+		oldMap.save(indexFile);
+
+		List<String> warnings = new ArrayList<>();
+		List<String> infos = new ArrayList<>();
+		PluginLog log = new PluginLog() {
+			@Override
+			public void info(String message) {
+				infos.add(message);
+			}
+
+			@Override
+			public void warn(String message) {
+				warnings.add(message);
+			}
+
+			@Override
+			public void debug(String message) {
+			}
+		};
+
+		IndexCompactionOperation.compact(depsDir, indexFile, log);
+
+		DependencyMap compacted = DependencyMap.load(indexFile);
+		assertTrue(compacted.testClasses().contains(currentTest));
+		assertFalse(compacted.testClasses().contains(staleTest));
+		assertTrue(compacted.isNativeUnit("src/current.cpp"));
+		assertTrue(compacted.get(currentTest).contains("src/current.cpp"));
+		assertTrue(warnings.stream()
+				.anyMatch(message -> message.contains(staleTest) && message.contains("absent from rebuilt .deps")));
+		assertTrue(infos.stream().anyMatch(message -> message.contains("Preserved 1 native edge(s)")));
+	}
+
+	@Test
 	void returnsNoDepsWhenDirectoryMissing() throws IOException {
 		Path missingDepsDir = tempDir.resolve("does-not-exist");
 		Path indexFile = tempDir.resolve(".test-order/test-order.idx");
