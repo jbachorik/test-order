@@ -347,8 +347,16 @@ public final class ChangeAnalysis {
 				for (PluginContext.NativeProjectEntry entry : ctx.nativeProjects()) {
 					try {
 						var mode = ChangeDetectionSupport.resolveMode(ctx.changeMode(), entry.hashFile());
-						nativeChanged.addAll(me.bechberger.testorder.changes.NativeChangeDetector.detect(mode,
-								entry.keyBase(), entry.roots(), entry.hashFile(), null, true, sharedRepoSnapshot));
+						// The readOnly parameter must track opts.readOnly(): the native hash
+						// snapshot is persistent state like the bytecode baseline. Select-path
+						// analysis runs BEFORE tests — advancing the snapshot there would make
+						// a subsequently broken/failed test run look clean on the next
+						// selection, silently missing native-affected tests. Order/auto/learn
+						// runs (readOnly=false) advance it; testOrderSnapshot stays the
+						// explicit reset.
+						nativeChanged.addAll(
+								me.bechberger.testorder.changes.NativeChangeDetector.detect(mode, entry.keyBase(),
+										entry.roots(), entry.hashFile(), null, opts.readOnly(), sharedRepoSnapshot));
 					} catch (IOException e) {
 						ctx.log().warn("[test-order] Native change detection failed for " + entry.keyBase() + ": "
 								+ e.getMessage() + " — falling back to no native changes for that project");
