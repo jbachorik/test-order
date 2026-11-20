@@ -680,10 +680,26 @@ class TestOrderPluginIntegrationTest {
         java.util.List<String> cmd = new java.util.ArrayList<>();
         cmd.add("git");
         cmd.addAll(java.util.Arrays.asList(args));
-        Process process = new ProcessBuilder(cmd)
-                .directory(dir.toFile())
-                .inheritIO()
-                .start();
+        // Neutralize machine-global git config for the test repos: the user's
+        // commit.gpgsign=true + ssh signing hangs every `git commit` for ~60s in
+        // headless runs (the signing agent cannot answer), failing unrelated tests.
+        java.util.Map<String, String> env = new java.util.HashMap<>();
+        env.put("GIT_CONFIG_NOSYSTEM", "1");
+        env.put("GIT_TERMINAL_PROMPT", "0");
+        env.put("GIT_CONFIG_COUNT", "5");
+        env.put("GIT_CONFIG_KEY_0", "gc.auto");
+        env.put("GIT_CONFIG_VALUE_0", "0");
+        env.put("GIT_CONFIG_KEY_1", "user.email");
+        env.put("GIT_CONFIG_VALUE_1", "t@example.com");
+        env.put("GIT_CONFIG_KEY_2", "user.name");
+        env.put("GIT_CONFIG_VALUE_2", "t");
+        env.put("GIT_CONFIG_KEY_3", "commit.gpgsign");
+        env.put("GIT_CONFIG_VALUE_3", "false");
+        env.put("GIT_CONFIG_KEY_4", "core.fsmonitor");
+        env.put("GIT_CONFIG_VALUE_4", "false");
+        ProcessBuilder builder = new ProcessBuilder(cmd).directory(dir.toFile()).inheritIO();
+        builder.environment().putAll(env);
+        Process process = builder.start();
         assertTrue(process.waitFor(60, TimeUnit.SECONDS),
                 "git " + String.join(" ", args) + " timed out");
         assertEquals(0, process.exitValue(),

@@ -299,7 +299,7 @@ public abstract class TestOrderExtension {
      *     nativeTests {
      *         sourceRoots = files("src/profiling")   // relative to this project; must stay under its directory
      *         coverageDir = layout.buildDirectory.dir("native-coverage") // per-test gcov artifacts
-     *         binaries = files("build/lib")          // optional; reserved for future use
+     *         binaries = files("build/native-build/objects") // optional; scopes collection to compiled sources
      *     }
      * }
      * </pre>
@@ -334,8 +334,15 @@ public abstract class TestOrderExtension {
         public abstract DirectoryProperty getCoverageDir();
 
         /**
-         * Optional native binaries or build-output directories. Not required for
-         * coverage parsing; reserved for future symbol resolution use.
+         * Optional build outputs (directories walked for gcov notes files, or a
+         * single binary with a best-effort same-stem notes sibling). When set,
+         * {@code testOrderNativeCollect} resolves the sources that were actually
+         * compiled into the tested build from the embedded gcov notes paths and
+         * scopes the JNI export scan and coverage parsing to them — sources
+         * under {@code sourceRoots} that were never compiled (vendored code,
+         * stale artifacts) can no longer contribute edges. Scoping is
+         * subtractive only: when no notes files are found the collection runs
+         * unscoped with a warning, so this can never suppress a real edge.
          */
         public abstract ConfigurableFileCollection getBinaries();
     }

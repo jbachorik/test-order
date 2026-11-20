@@ -3482,6 +3482,28 @@ public class TestOrderPlugin implements Plugin<Project> {
     }
 
     /** Coverage directory declared for native collect, or null when not set. */
+    /**
+     * Resolves the declared {@code nativeTests.binaries} entries against the
+     * project directory (relative entries are project-relative, matching the
+     * per-project keying of the native roots). Empty when the DSL block or the
+     * property is unset — the collect pipeline then runs unscoped.
+     */
+    static List<Path> resolveNativeBinaries(Project project, TestOrderExtension ext) {
+        TestOrderExtension.NativeTests nativeTests = ext.getNativeTests();
+        if (nativeTests == null || nativeTests.getBinaries() == null) {
+            return List.of();
+        }
+        List<Path> resolved = new ArrayList<>();
+        for (File f : nativeTests.getBinaries().getFiles()) {
+            Path p = f.toPath();
+            if (!p.isAbsolute()) {
+                p = project.getProjectDir().toPath().resolve(p);
+            }
+            resolved.add(p.toAbsolutePath().normalize());
+        }
+        return resolved;
+    }
+
     static Path resolveNativeCoverageDir(Project project, TestOrderExtension ext) {
         TestOrderExtension.NativeTests nt = ext.getNativeTests();
         if (nt == null) {
@@ -3522,10 +3544,11 @@ public class TestOrderPlugin implements Plugin<Project> {
         }
         Path projectRoot = project.getProjectDir().toPath().toAbsolutePath().normalize();
         Path indexFile = ext.getIndexFile().get().getAsFile().toPath();
+        List<Path> nativeBinaries = resolveNativeBinaries(project, ext);
         try {
             me.bechberger.testorder.ops.NativeCollectOperation.Result result =
                     me.bechberger.testorder.ops.NativeCollectOperation.collect(
-                            projectRoot, nativeRoots, coverageDir, indexFile, wrapLog(project));
+                            projectRoot, nativeRoots, coverageDir, indexFile, wrapLog(project), nativeBinaries);
             project.getLogger().lifecycle("[test-order] Native collect: {} artifact(s) parsed, "
                             + "{} test(s) with gcov edges, {} JNI export(s), cross-check: {} edge(s) for {} test(s)",
                     result.artifactsParsed(), result.testsWithGcovEdges(), result.jniExportCount(),

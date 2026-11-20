@@ -199,6 +199,47 @@ class NativeCollectIntegrationTest {
                 "native hash snapshot must be written for since-last-run native change detection");
     }
 
+    @Test
+    @DisplayName("declared binaries scope collection to sources compiled into the tested build")
+    void declaredBinariesScopeCollectionToCompiledSources() throws IOException {
+        scaffoldNativeProject();
+        // vendored source under the same root, with its own export and coverage
+        writeFile("src/profiling/vendored.cpp", ""
+                + "#include <jni.h>\n"
+                + "JNIEXPORT void JNICALL Java_com_example_Vendored_run(JNIEnv* env, jobject obj) {}\n");
+        writeFile("build/native-coverage/com.example.BarTest.json", ""
+                + "{\"test\": \"com.example.BarTest\", \"coveredFiles\": "
+                + "[\"src/profiling/foo.cpp\", \"src/profiling/vendored.cpp\"]}\n");
+        // fake gcov notes: only foo.cpp was compiled into the tested build
+        Path objectsDir = projectDir.resolve("build/native-objects");
+        Files.createDirectories(objectsDir);
+        Files.writeString(objectsDir.resolve("foo.gcno"),
+                "gcno\u00ff\u00ff\u0000" + projectDir.resolve("src/profiling/foo.cpp") + "\u0000");
+        writeFile("build.gradle", ""
+                + "plugins {\n"
+                + "    id 'me.bechberger.test-order'\n"
+                + "}\n"
+                + "testOrder {\n"
+                + "    nativeTests {\n"
+                + "        sourceRoots = files('src/profiling')\n"
+                + "        coverageDir = layout.projectDirectory.dir('build/native-coverage')\n"
+                + "        binaries = files('build/native-objects')\n"
+                + "    }\n"
+                + "}\n");
+
+        BuildResult result = runner("testOrderNativeCollect", "--quiet").build();
+        assertEquals(SUCCESS, result.task(":testOrderNativeCollect").getOutcome());
+
+        DependencyMap after = DependencyMap.load(projectDir.resolve(".test-order/test-dependencies.lz4"));
+        assertTrue(after.get("com.example.BarTest").contains("src/profiling/foo.cpp"),
+                "compiled covered source must keep its edge");
+        assertTrue(!after.get("com.example.BarTest").contains("src/profiling/vendored.cpp"),
+                "covered source never compiled into the declared binaries must be dropped: "
+                        + after.get("com.example.BarTest"));
+        assertTrue(!after.get("com.example.FooTest").contains("src/profiling/vendored.cpp"),
+                "cross-check must be scoped too: " + after.get("com.example.FooTest"));
+    }
+
     private void writeRichBuildGradleWithoutNativeTests() throws IOException {
         writeFile("build.gradle", """
                 plugins {

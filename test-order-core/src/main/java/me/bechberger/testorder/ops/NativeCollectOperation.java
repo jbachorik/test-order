@@ -70,18 +70,64 @@ public final class NativeCollectOperation {
 	 */
 	public static Result collect(Path projectRoot, List<Path> nativeRoots, Path coverageDir, Path indexFile,
 			PluginLog log) throws IOException {
+		return collect(projectRoot, nativeRoots, coverageDir, indexFile, log, List.of());
+	}
+
+	/**
+	 * Collects gcov and JNI cross-check edges, scoped to the declared binaries.
+	 *
+	 * <p>
+	 * When {@code binaries} is non-empty (the {@code nativeTests.binaries} DSL),
+	 * the gcov notes files under the declared build outputs identify the sources
+	 * that were actually compiled into the tested build, and both the JNI export
+	 * scan and the coverage parsing are restricted to them — sources under the
+	 * roots that were never compiled (vendored code, stale artifacts) can no longer
+	 * contribute false-positive edges. Degradation contract: when no notes files
+	 * are found, scoping is disabled with a warning and the full unscoped pipeline
+	 * runs; scoping is subtractive only.
+	 */
+	public static Result collect(Path projectRoot, List<Path> nativeRoots, Path coverageDir, Path indexFile,
+			PluginLog log, List<Path> binaries) throws IOException {
 		if (!Files.isRegularFile(indexFile)) {
 			throw new IOException(
 					"Dependency index not found at " + indexFile + ".\nRun: ./gradlew test -Dtestorder.mode=learn");
 		}
 		List<String> warnings = new ArrayList<>();
 
+		// 0. Compiled-source scoping from the declared binaries' gcov notes. An
+		// empty set disables scoping (subtractive-only contract).
+		Set<String> compiledKeys = me.bechberger.testorder.nativecov.CompiledNativeSources.compiledSourceKeys(binaries,
+				projectRoot, nativeRoots);
+		boolean scoped = !binaries.isEmpty();
+		if (scoped && compiledKeys.isEmpty()) {
+			warnings.add("no gcov notes files (.gcno) found under the declared binaries — compiled-source "
+					+ "scoping disabled, scanning all declared source roots");
+		} else if (scoped) {
+			log.info("[test-order] Native collect: compiled-source scoping active — " + compiledKeys.size()
+					+ " compiled source file(s) from the declared binaries");
+		}
+
 		// 1. gcov artifacts → test → native file edges
 		NativeCoverageParser.Result parsed = NativeCoverageParser.parse(projectRoot, coverageDir, nativeRoots);
 		warnings.addAll(parsed.warnings());
+		Map<String, Set<String>> testToFiles = parsed.testToFiles();
+		if (scoped && !compiledKeys.isEmpty()) {
+			Map<String, Set<String>> filtered = new java.util.LinkedHashMap<>();
+			for (Map.Entry<String, Set<String>> e : testToFiles.entrySet()) {
+				Set<String> kept = new java.util.TreeSet<>(e.getValue());
+				kept.retainAll(compiledKeys);
+				if (!kept.isEmpty()) {
+					filtered.put(e.getKey(), kept);
+				}
+			}
+			testToFiles = filtered;
+		}
 
 		// 2. JNI exports → member key → native file(s)
 		Map<String, Set<String>> fileToExports = JniExportScanner.scan(projectRoot, nativeRoots);
+		if (scoped && !compiledKeys.isEmpty()) {
+			fileToExports.keySet().retainAll(compiledKeys);
+		}
 		Map<String, Set<String>> exportToFiles = new HashMap<>();
 		for (Map.Entry<String, Set<String>> e : fileToExports.entrySet()) {
 			for (String memberKey : e.getValue()) {
@@ -91,7 +137,7 @@ public final class NativeCollectOperation {
 
 		// 3. Gcov edges are filtered before the native-aware locked merge so absolute
 		// machine-specific paths are never persisted.
-		Map<String, Set<String>> gcovEdgesByTest = filterAbsoluteNativeKeys(parsed.testToFiles(), warnings);
+		Map<String, Set<String>> gcovEdgesByTest = filterAbsoluteNativeKeys(testToFiles, warnings);
 		int gcovTests = gcovEdgesByTest.size();
 		int gcovEdges = gcovEdgesByTest.values().stream().mapToInt(Set::size).sum();
 		int jniExportCount = fileToExports.values().stream().mapToInt(Set::size).sum();

@@ -404,7 +404,7 @@ testOrder {
     nativeTests {
         sourceRoots = files("src/profiling")          // C/C++ sources tracked for changes
         coverageDir = layout.buildDirectory.dir("native-coverage") // per-test gcov artifacts
-        binaries = files("build/libprofiling.so")     // optional; reserved for future use
+        binaries = files("build/native-build/objects") // optional; scopes collection to compiled sources
     }
 }
 ```

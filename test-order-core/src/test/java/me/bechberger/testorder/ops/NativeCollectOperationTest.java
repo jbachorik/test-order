@@ -74,6 +74,61 @@ class NativeCollectOperationTest {
 	}
 
 	@Test
+	void declaredBinariesScopeCoverageAndJniEdgesToCompiledSources() throws IOException {
+		setup();
+		writeIndex();
+		writeNativeFile("src/profiling/foo.cpp",
+				"JNIEXPORT void JNICALL Java_com_example_Foo_run(JNIEnv*, jobject) {}");
+		writeNativeFile("src/profiling/vendored.cpp",
+				"JNIEXPORT void JNICALL Java_com_example_Vendored_run(JNIEnv*, jobject) {}");
+		Files.writeString(coverageDir.resolve("com.example.BarTest.json"),
+				"{\"test\": \"com.example.BarTest\", \"coveredFiles\": [\"src/profiling/foo.cpp\", "
+						+ "\"src/profiling/vendored.cpp\"]}",
+				StandardCharsets.UTF_8);
+
+		// Fake gcov notes: only foo.cpp was compiled into the tested build. The
+		// extractor scans printable runs for tracked source extensions, so magic
+		// and padding bytes around the embedded path are irrelevant.
+		Path binaryDir = root.resolve("build/native-build/objects");
+		Files.createDirectories(binaryDir);
+		Files.writeString(binaryDir.resolve("foo.gcno"),
+				"gcno\u00ff\u00ff\u0000" + root.toAbsolutePath().resolve("src/profiling/foo.cpp") + "\u0000",
+				StandardCharsets.ISO_8859_1);
+
+		NativeCollectOperation.Result result = NativeCollectOperation.collect(root, java.util.List.of(nativeRoot),
+				coverageDir, indexFile, PluginLog.NOOP, java.util.List.of(binaryDir));
+
+		assertEquals(1, result.jniExportCount(), "only the compiled source's export may be scanned");
+		assertEquals(1, result.testsWithGcovEdges());
+		assertEquals(1, result.crossCheckTests(), "cross-check must survive scoping for compiled sources");
+		DependencyMap after = DependencyMap.load(indexFile);
+		assertEquals(Set.of("src/profiling/foo.cpp"), after.get("com.example.BarTest"),
+				"coverage edges for sources never compiled into the tested build must be dropped");
+	}
+
+	@Test
+	void declaredBinariesWithoutNotesFilesDisableScopingWithAWarning() throws IOException {
+		setup();
+		writeIndex();
+		writeNativeFile("src/profiling/foo.cpp",
+				"JNIEXPORT void JNICALL Java_com_example_Foo_run(JNIEnv*, jobject) {}");
+		Files.writeString(coverageDir.resolve("com.example.BarTest.json"),
+				"{\"test\": \"com.example.BarTest\", \"coveredFiles\": [\"src/profiling/foo.cpp\"]}",
+				StandardCharsets.UTF_8);
+
+		Path emptyBinaryDir = root.resolve("build/empty");
+		Files.createDirectories(emptyBinaryDir);
+		NativeCollectOperation.Result result = NativeCollectOperation.collect(root, java.util.List.of(nativeRoot),
+				coverageDir, indexFile, PluginLog.NOOP, java.util.List.of(emptyBinaryDir));
+
+		// Degradation contract: no notes files → full unscoped pipeline.
+		assertEquals(1, result.jniExportCount());
+		assertEquals(1, result.testsWithGcovEdges());
+		assertTrue(result.warnings().stream().anyMatch(w -> w.contains("scoping disabled")),
+				"expected the scoping-disabled warning, got: " + result.warnings());
+	}
+
+	@Test
 	void gcovEdgesAndJniCrossCheckMergeIntoIndex() throws IOException {
 		setup();
 		writeIndex();
